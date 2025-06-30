@@ -4,129 +4,405 @@
  */
 package net.minecraftforge.mcmaven.impl.util;
 
+import net.minecraftforge.mcmaven.impl.GlobalOptions;
+import net.minecraftforge.mcmaven.impl.util.function.CallableBiConsumer;
+import net.minecraftforge.mcmaven.impl.util.function.CallableBoolConsumer;
+import net.minecraftforge.mcmaven.impl.util.function.CallableConsumer;
+import net.minecraftforge.mcmaven.impl.util.function.CallableFunction;
+import net.minecraftforge.util.hash.HashStore;
 import net.minecraftforge.util.logging.Log;
+import org.jetbrains.annotations.Contract;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
+import java.nio.file.Files;
 import java.util.Arrays;
-import java.util.Iterator;
-import java.util.Set;
+import java.util.List;
+import java.util.Objects;
+import java.util.SequencedCollection;
 import java.util.concurrent.Callable;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
+import java.util.stream.StreamSupport;
 
-/** Represents a task that can be executed. Tasks in this tool <strong>will always</strong> provide a file. */
-public sealed interface Task extends Supplier<File> permits Task.Existing, Task.Simple {
-    static Task existing(String name, File file) {
-        return new Existing(name, file);
+/**
+ * A task represents a work action that generates a file.
+ * <p>The {@link Cacheable} implementation has built-in caching using {@link HashStore}, and it is recommended to create
+ * tasks this way using {@link #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)}.
+ */
+public interface Task {
+    /**
+     * Executes this task and returns the output file.
+     * <p>It is not always guaranteed to run the work required.
+     *
+     * @return The output file for this task
+     */
+    File execute();
+
+    /**
+     * Whether this task has had its work executed and the output file has been resolved.
+     *
+     * @return If this task's output has been resolved
+     */
+    boolean isResolved();
+
+    /**
+     * Whether this task needed to do any actual work in order to calculate its output.
+     *
+     * @return If this task's output is up-to-date
+     */
+    default boolean isUpToDate() {
+        return false;
     }
 
-    static Task named(String name, Callable<File> supplier) {
-        return named(name, Set.of(), supplier);
+    /**
+     * The unique name for this task.
+     *
+     * @return The name for this task
+     * @implNote The uniqueness of the task name is not enforced, but is required in order to track and debug the
+     * execution process.
+     */
+    String getName();
+
+    static SequencedCollection<Supplier<Task>> deps(Task... tasks) {
+        return Arrays.stream(tasks).map(Util::supplyingSelf).toList();
     }
 
-    static Task named(String name, Iterable<? extends Task> deps, Callable<File> supplier) {
-        return new Simple(name, deps, supplier);
+    @SafeVarargs
+    static SequencedCollection<? extends Supplier<? extends Task>> deps(Supplier<? extends Task>... tasks) {
+        return List.of(tasks);
     }
 
-    static Iterable<? extends Task> collect(Object... deps) {
-        return () -> new Iterator<>() {
-            private final Iterator<?> itor = Arrays.asList(deps).iterator();
+    static SequencedCollection<Supplier<Task>> deps(Iterable<?> tasks) {
+        return StreamSupport.stream(tasks.spliterator(), false).map(Task::cast).toList();
+    }
 
-            @Override
-            public boolean hasNext() {
-                return this.itor.hasNext();
-            }
-
-            @Override
-            public Task next() {
-                var obj = this.itor.next();
-                if (!(obj instanceof Task) && obj instanceof Supplier<?> supplier) {
-                    obj = supplier.get();
-                }
-
-                try {
-                    return (Task) obj;
-                } catch (ClassCastException e) {
-                    throw new IllegalArgumentException("Invalid task dependency. Expected Task or Supplier<Task>, Found: %s".formatted(obj), e);
-                }
+    private static Supplier<Task> cast(Object obj) {
+        return () -> {
+            var ret = obj instanceof Supplier<?> supplier ? supplier.get() : obj;
+            try {
+                return (Task) Objects.requireNonNull(ret);
+            } catch (ClassCastException | NullPointerException e) {
+                throw new IllegalArgumentException("Expected Task or Supplier<Task>, found %s".formatted(ret != null ? ret.getClass() : "null"));
             }
         };
     }
 
-    /**
-     * Executes the task. If it has already been executed, the work will be skipped and the file will be provided
-     * instantly.
-     *
-     * @return The file provided by this task
-     */
-    File execute();
-
-    boolean resolved();
-
-    /** @return The name of this task */
-    String name();
-
-    /** @see #execute() */
-    @Override
-    default File get() {
-        return this.execute();
-    }
-
-    final class Simple implements Task {
+    abstract class Abstract implements Task {
         private final String name;
-        private final Iterable<? extends Task> deps;
-        private final Callable<File> supplier;
-        private File file;
+        private final SequencedCollection<? extends Supplier<? extends Task>> dependencies;
+        private @Nullable File result;
 
-        private Simple(String name, Iterable<? extends Task> deps, Callable<File> supplier) {
+        protected Abstract(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies) {
             this.name = name;
-            this.deps = deps;
-            this.supplier = supplier;
+            this.dependencies = dependencies;
         }
 
         @Override
-        public File execute() {
-            if (this.file == null) {
-                for (var dep : deps)
-                    dep.execute();
-                Log.info(name);
-                Log.push();
-                try {
-                    this.file = supplier.call();
-                } catch (Exception e) {
-                    Util.sneak(e);
-                }
-                Log.debug("-> " + this.file.getAbsolutePath());
-                Log.pop();
-            }
-
-            return this.file;
-        }
-
-        @Override
-        public boolean resolved() {
-            return this.file != null;
-        }
-
-        @Override
-        public String name() {
+        public final String getName() {
             return this.name;
         }
 
         @Override
+        public final boolean isResolved() {
+            return this.result != null;
+        }
+
+        @Override
+        public final File execute() {
+            // immediately stop if result is already calculated
+            if (this.result != null)
+                return this.result;
+
+            // run all task dependencies (order enforced by SequencedCollection)
+            for (var t : this.dependencies) {
+                var task = t.get();
+                try {
+                    task.execute();
+                } catch (Exception e) {
+                    throw new RuntimeException("Failed to execute task `%s` which is required by task `%s`".formatted(task.getName(), this.getName()), e);
+                }
+            }
+
+            Log.info(this.getName());
+            var indent = Log.push();
+            try {
+                return this.result = this.doWork();
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to execute task `%s`".formatted(this.getName()));
+            } finally {
+                Log.pop(indent);
+            }
+        }
+
+        protected abstract File doWork() throws Exception;
+
+        @Override
         public String toString() {
-            return "Task[" + this.name + ']';
+            return "Task[" + this.getName() + ']';
         }
     }
 
-    record Existing(String name, File execute) implements Task {
-        @Override
-        public boolean resolved() {
-            return true;
+
+
+    /* SIMPLE IMPLEMENTATION */
+
+    static Task simple(String name, Callable<File> callable) {
+        return simple(name, List.of(), callable);
+    }
+
+    static Task simple(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> callable) {
+        return new Simple(name, dependencies, callable);
+    }
+
+    final class Simple extends Abstract {
+        private final Callable<File> callable;
+
+        private Simple(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> callable) {
+            super(name, dependencies);
+            this.callable = callable;
+        }
+
+        protected File doWork() throws Exception {
+            return this.callable.call();
         }
 
         @Override
         public String toString() {
-            return "Task[" + this.name + ']';
+            return "Task.Simple[" + this.getName() + ']';
         }
+    }
+
+
+    /* CACHEABLE IMPLEMENTATION */
+
+    /**
+     * Creates a simple cacheable task that outputs a single regular file.
+     *
+     * @param name     The unique name for the task
+     * @param output   The output file for the task
+     * @param callbackConsumer The callback consumer to use for this task
+     * @return A new task
+     * @see #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
+     */
+    static Task cachingFile(String name, File output, Cacheable.CallbackConsumer callbackConsumer) {
+        return cachingFile(name, () -> output, callbackConsumer);
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a single regular file.
+     *
+     * @param name     The unique name for the task
+     * @param output   The output file for the task
+     * @param callbackConsumer The callback consumer to use for this task
+     * @return A new task
+     * @see #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
+     */
+    static Task cachingFile(String name, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
+        return cachingFile(name, List.of(), output, callbackConsumer);
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a single regular file.
+     *
+     * @param name         The unique name for the task
+     * @param output       The output file for the task
+     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer     The callback consumer to use for this task
+     * @return A new task
+     */
+    static Task cachingFile(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, File output, Cacheable.CallbackConsumer callbackConsumer) {
+        return cachingFile(name, dependencies, () -> output, callbackConsumer);
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a single regular file.
+     *
+     * @param name         The unique name for the task
+     * @param output       The output file for the task
+     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer     The callback consumer to use for this task
+     * @return A new task
+     */
+    static Task cachingFile(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
+        return new Cacheable(name, dependencies, output, callbackConsumer, o -> Files.createDirectories(o.getParentFile().toPath()), o -> HashStore.fromFile(o).add("output", o), (c, o) -> c.add("output", o));
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a directory.
+     *
+     * @param name     The unique name for the task
+     * @param output   The output file for the task
+     * @param callbackConsumer The callback consumer to use for this task
+     * @return A new task
+     * @see #cachingDir(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
+     */
+    static Task cachingDir(String name, File output, Cacheable.CallbackConsumer callbackConsumer) {
+        return cachingDir(name, () -> output, callbackConsumer);
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a directory.
+     *
+     * @param name     The unique name for the task
+     * @param output   The output file for the task
+     * @param callbackConsumer The callback consumer to use for this task
+     * @return A new task
+     * @see #cachingDir(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
+     */
+    static Task cachingDir(String name, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
+        return cachingDir(name, List.of(), output, callbackConsumer);
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a directory.
+     *
+     * @param name         The unique name for the task
+     * @param output       The output file for the task
+     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer     The callback consumer to use for this task
+     * @return A new task
+     */
+    static Task cachingDir(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, File output, Cacheable.CallbackConsumer callbackConsumer) {
+        return cachingDir(name, dependencies, () -> output, callbackConsumer);
+    }
+
+    /**
+     * Creates a simple cacheable task that outputs a directory.
+     *
+     * @param name         The unique name for the task
+     * @param output       The output file for the task
+     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer     The callback consumer to use for this task
+     * @return A new task
+     */
+    static Task cachingDir(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
+        return new Cacheable(name, dependencies, output, callbackConsumer, o -> Files.createDirectories(o.toPath()), HashStore::fromDir, (c, o) -> { });
+    }
+
+    final class Cacheable extends Abstract {
+        private final Callable<File> output;
+        private final CallbackConsumer callbackConsumer;
+
+        private final CallableConsumer<? super File> outputEnsurer;
+        private final CallableFunction<? super File, ? extends HashStore> cacheProvider;
+        private final CallableBiConsumer<? super HashStore, ? super File> cacheFinisher;
+
+        private boolean upToDate;
+
+        private Cacheable(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, CallbackConsumer callbackConsumer, CallableConsumer<? super File> outputEnsurer, CallableFunction<? super File, ? extends HashStore> cacheProvider, CallableBiConsumer<? super HashStore, ? super File> cacheFinisher) {
+            super(name, dependencies);
+            this.output = output;
+            this.callbackConsumer = callbackConsumer;
+
+            this.outputEnsurer = outputEnsurer;
+            this.cacheProvider = cacheProvider;
+            this.cacheFinisher = cacheFinisher;
+        }
+
+        @Override
+        public boolean isUpToDate() {
+            if (!this.isResolved())
+                throw new IllegalStateException("Cannot check if a cacheable task is up-to-date before executing it");
+
+            return this.upToDate;
+        }
+
+        protected File doWork() throws Exception {
+            var output = this.output.call().getAbsoluteFile();
+            this.outputEnsurer.accept(output);
+            var cache = this.cacheProvider.accept(output);
+
+            var callback = new CallbackImpl().check(c -> output.exists() && c.isSame());
+            this.callbackConsumer.accept(callback, output);
+
+            callback.setup.accept(cache);
+            boolean cacheMiss = !callback.check.test(cache);
+            if (cacheMiss) {
+                GlobalOptions.assertNotCacheOnly();
+                Log.debug("Cache miss, doing work");
+
+                callback.run.accept(cache);
+                if (cache.isSaved()) {
+                    throw new IllegalStateException("Task `%s` attempted to save cache manually, this is handled internally".formatted(this.getName()));
+                } else {
+                    this.cacheFinisher.accept(cache, output);
+                    cache.save();
+                }
+            } else {
+                this.upToDate = true;
+                Log.debug("Using cached output");
+            }
+
+            callback.cleanup.accept(cacheMiss);
+            Log.debug("-> " + output.getAbsolutePath());
+            return output;
+        }
+
+        @Override
+        public String toString() {
+            return "Task.Cacheable[" + this.getName() + ']';
+        }
+
+        public interface Callback {
+            @Contract("_ -> this")
+            Callback setup(CallableConsumer<? super HashStore> setup);
+
+            @Contract("_ -> this")
+            Callback check(Predicate<? super HashStore> check);
+
+            @Contract("_ -> this")
+            Callback checkWith(UnaryOperator<Predicate<? super HashStore>> check);
+
+            @Contract("_ -> this")
+            Callback run(CallableConsumer<? super HashStore> run);
+
+            @Contract("_ -> this")
+            Callback cleanup(CallableBoolConsumer cleanup);
+        }
+
+        private static final class CallbackImpl implements Callback {
+            private CallableConsumer<? super HashStore> setup = c -> { };
+            private Predicate<? super HashStore> check = c -> true;
+            private CallableConsumer<? super HashStore> run = c -> { };
+            private CallableBoolConsumer cleanup = b -> { };
+
+            @Override
+            public CallbackImpl setup(CallableConsumer<? super HashStore> setup) {
+                this.setup = setup != null ? setup : c -> { };
+                return this;
+            }
+
+            @Override
+            public CallbackImpl check(Predicate<? super HashStore> check) {
+                this.check = check != null ? check : c -> true;
+                return this;
+            }
+
+            @Override
+            public CallbackImpl checkWith(UnaryOperator<Predicate<? super HashStore>> check) {
+                if (check != null)
+                    this.check = check.apply(this.check);
+                return this;
+            }
+
+            @Override
+            public CallbackImpl run(CallableConsumer<? super HashStore> run) {
+                this.run = run != null ? run : c -> { };
+                return this;
+            }
+
+            @Override
+            public Callback cleanup(CallableBoolConsumer cleanup) {
+                this.cleanup = cleanup != null ? cleanup : b -> { };
+                return this;
+            }
+        }
+
+        public interface CallbackConsumer {
+            void accept(Callback callback, File output) throws Exception;
+        }
+
     }
 }

@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.util.TimeZone;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 
@@ -71,6 +72,10 @@ public class Util {
     @Contract("null, _ -> null")
     public static <T, R> @Nullable R replace(@Nullable T obj, Function<T, @Nullable R> action) {
         return obj != null ? action.apply(obj) : null;
+    }
+
+    public static <R> Supplier<R> supplyingSelf(R r) {
+        return () -> r;
     }
 
     public static String hash(HashFunction func, @UnknownNullability File... files) {
