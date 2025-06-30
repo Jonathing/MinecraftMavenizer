@@ -181,8 +181,9 @@ public class ParchmentMappings extends Mappings {
         var ret = new ArrayList<String[]>();
         ret.add(header);
 
-        for (var key : cData.keySet()) {
-            var c = cData.get(key);
+        for (var entry : cData.entrySet()) {
+            var key = entry.getKey();
+            var c = entry.getValue();
             var s = sData.get(key);
             if (c.equals(s)) {
                 ret.add(new String[] { key, c.name, "2", c.desc });

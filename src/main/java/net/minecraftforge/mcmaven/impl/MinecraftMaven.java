@@ -53,7 +53,7 @@ public record MinecraftMaven(File output, Cache cache, Mappings mappings) {
 
         if (Constants.FORGE_GROUP.equals(artifact.getGroup()) && Constants.FORGE_NAME.equals(artifact.getName())) {
             var repo = new ForgeRepo(this.cache, mcprepo);
-            if (artifact.getVersion() == null)
+            if (version == null)
                 throw new IllegalArgumentException("No version specified for Forge");
 
             if ("all".equals(version)) {
@@ -79,7 +79,7 @@ public record MinecraftMaven(File output, Cache cache, Mappings mappings) {
                 finalize(artifact, mappings, artifacts);
             }
         } else if (Constants.MC_GROUP.equals(artifact.getGroup())) {
-            if (artifact.getVersion() == null)
+            if (version == null)
                 throw new IllegalArgumentException("No version specified for MCPConfig");
 
             var mappings = this.mappings().withMCVersion(mcpToMcVersion(version));
@@ -151,7 +151,7 @@ public record MinecraftMaven(File output, Cache cache, Mappings mappings) {
             }
 
             if (pending.getVariants() != null) {
-                var source = pending.getVariants().get();
+                var source = pending.getVariants().execute();
                 var cache = HashStore.fromFile(target)
                     .add("source", source);
 

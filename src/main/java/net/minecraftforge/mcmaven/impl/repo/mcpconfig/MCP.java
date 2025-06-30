@@ -72,8 +72,9 @@ public class MCP {
         if (config.steps == null || config.steps.isEmpty())
             throw new IllegalStateException("Invalid MCP Config: " + name + " - Missing steps");
 
-        for (var side : config.steps.keySet()) {
-            var steps = config.steps.get(side);
+        for (var entry : config.steps.entrySet()) {
+            var side = entry.getKey();
+            var steps = entry.getValue();
             for (int x = 0; x < steps.size(); x++) {
                 var type = steps.get(x).get("type");
                 if (type == null)
