@@ -92,59 +92,54 @@ public class Mappings {
         var srg = side.getTasks().getMappings();
         var client = mc.versionFile("client_mappings", "txt");
         var server = mc.versionFile("server_mappings", "txt");
-        ret = Task.named("srg2names[" + this + ']',
-            Set.of(srg, client, server),
-            () -> getMappings(side, srg, client, server)
+        var root = getFolder(new File(side.getMCP().getBuildFolder(), "data/mappings"));
+        ret = Task.cachingFile("srg2names[" + this + ']',
+            Task.deps(srg, client, server),
+            new File(root, "official.zip"),
+            (c, o) -> getMappings(c, o, side, srg, client, server)
         );
         tasks.put(side, ret);
 
         return ret;
     }
 
-    private File getMappings(MCPSide side, Task srgMappings, Task clientTask, Task serverTask) {
+    private void getMappings(Task.Cacheable.Callback callback, File output, MCPSide side, Task srgMappings, Task clientTask, Task serverTask) {
         var tool = side.getMCP().getCache().maven().download(Constants.INSTALLER_TOOLS);
 
-        var root = getFolder(new File(side.getMCP().getBuildFolder(), "data/mapings"));
-        var output = new File(root, "official.zip");
+        var root = getFolder(new File(side.getMCP().getBuildFolder(), "data/mappings"));
         var log = new File(root, "official.log");
 
         var mappings = srgMappings.execute();
         var client = clientTask.execute();
         var server = serverTask.execute();
 
-        var cache = HashStore.fromFile(output);
-        cache.add("tool", tool);
-        cache.add("mappings", mappings);
-        cache.add("client", client);
-        cache.add("server", server);
+        callback.setup(cache -> cache
+            .add("tool", tool)
+            .add("mappings", mappings)
+            .add("client", client)
+            .add("server", server));
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.run(cache -> {
+            var args = List.of(
+                "--task",
+                "MAPPINGS_CSV",
+                "--srg",
+                mappings.getAbsolutePath(),
+                "--client",
+                client.getAbsolutePath(),
+                "--server",
+                server.getAbsolutePath(),
+                "--output",
+                output.getAbsolutePath()
+            );
 
-        GlobalOptions.assertNotCacheOnly();
+            var jdk = side.getMCP().getCache().jdks().get(Constants.INSTALLER_TOOLS_JAVA_VERSION);
+            if (jdk == null)
+                throw new IllegalStateException("Failed to find JDK for version " + Constants.INSTALLER_TOOLS_JAVA_VERSION);
 
-        var args = List.of(
-            "--task",
-            "MAPPINGS_CSV",
-            "--srg",
-            mappings.getAbsolutePath(),
-            "--client",
-            client.getAbsolutePath(),
-            "--server",
-            server.getAbsolutePath(),
-            "--output",
-            output.getAbsolutePath()
-        );
-
-        var jdk = side.getMCP().getCache().jdks().get(Constants.INSTALLER_TOOLS_JAVA_VERSION);
-        if (jdk == null)
-            throw new IllegalStateException("Failed to find JDK for version " + Constants.INSTALLER_TOOLS_JAVA_VERSION);
-
-        var ret = ProcessUtils.runJar(jdk, log.getParentFile(), log, tool, Collections.emptyList(), args);
-        if (ret.exitCode != 0)
-            throw new IllegalStateException("Failed to run MCP Step, See log: " + log.getAbsolutePath());
-
-        cache.save();
-        return output;
+            var ret = ProcessUtils.runJar(jdk, log.getParentFile(), log, tool, List.of(), args);
+            if (ret.exitCode != 0)
+                throw new IllegalStateException("Failed to run MCP Step, See log: " + log.getAbsolutePath());
+        });
     }
 }

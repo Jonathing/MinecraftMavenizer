@@ -5,7 +5,7 @@
 package net.minecraftforge.mcmaven.cli;
 
 import java.io.File;
-import java.util.Set;
+import java.util.List;
 
 import joptsimple.OptionParser;
 import net.minecraftforge.mcmaven.impl.MinecraftMaven;
@@ -52,13 +52,14 @@ public class MCPTask {
             "Root directory to generate the maven repository")
             .withRequiredArg().ofType(File.class).defaultsTo(new File("output.jar"));
 
-        var artifactO = parser.accepts("artifact",
-            "MCPConfig artifact coordinates")
-            .withRequiredArg();
+        var artifactOBuilder = parser.accepts("artifact",
+            "MCPConfig artifact coordinates");
+        var artifactO = artifactOBuilder.withRequiredArg();
 
         var versionO = parser.accepts("version",
             "MCPConfig artifact version")
-            .withRequiredArg();
+            .requiredUnless(artifactO).withRequiredArg();
+        artifactOBuilder.requiredUnless(versionO);
 
         var pipelineO = parser.accepts("pipeline",
             "MCPConfig pipeline to run, typically [client|server|joined]")
@@ -171,12 +172,18 @@ public class MCPTask {
             var predecomp = side.getTasks().getPreDecompile();
             if (ats != null) {
                 var tmp = predecomp;
-                predecomp = Task.named("modifyAccess", Set.of(tmp), () -> Patcher.modifyAccess(dir, tmp, ats, repo.getCache()));
+                predecomp = Task.cachingFile("modifyAccess",
+                    Task.deps(tmp),
+                    new File(dir, "modifyAccess.jar"),
+                    (c, o) -> Patcher.modifyAccess(c, o, dir, tmp, ats, repo.getCache()));
             }
 
             if (sas != null) {
                 var tmp = predecomp;
-                predecomp = Task.named("stripSides", Set.of(tmp), () -> Patcher.stripSides(dir, tmp, sas, repo.getCache()));
+                predecomp = Task.cachingFile("stripSides",
+                    Task.deps(tmp),
+                    new File(dir, "stripSides.jar"),
+                    (c, o) -> Patcher.stripSides(c, o, dir, tmp, sas, repo.getCache()));
             }
 
             var factory = side.getTasks().child(dir, predecomp);
@@ -205,7 +212,7 @@ public class MCPTask {
                     ? new ParchmentMappings(options.valueOf(parchmentO))
                     : new Mappings("official", null).withMCVersion(MinecraftMaven.mcpToMcVersion(artifact.getVersion()));
 
-                var renameTask = new RenameTask(side.getBuildFolder(), pipeline, side, Task.existing("sources", sources), mappings).get();
+                var renameTask = new RenameTask(side.getBuildFolder(), pipeline, side, sourcesTask, mappings);
                 sources = renameTask.execute();
             } finally {
                 Log.pop(indent);

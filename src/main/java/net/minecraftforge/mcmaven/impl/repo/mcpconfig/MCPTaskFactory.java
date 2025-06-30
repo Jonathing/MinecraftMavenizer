@@ -4,6 +4,28 @@
  */
 package net.minecraftforge.mcmaven.impl.repo.mcpconfig;
 
+import com.google.gson.reflect.TypeToken;
+import io.codechicken.diffpatch.cli.PatchOperation;
+import io.codechicken.diffpatch.util.Input.MultiInput;
+import io.codechicken.diffpatch.util.LogLevel;
+import io.codechicken.diffpatch.util.Output.MultiOutput;
+import io.codechicken.diffpatch.util.PatchMode;
+import io.codechicken.diffpatch.util.archiver.ArchiveFormat;
+import net.minecraftforge.mcmaven.impl.cache.MavenCache;
+import net.minecraftforge.mcmaven.impl.util.Artifact;
+import net.minecraftforge.mcmaven.impl.util.Constants;
+import net.minecraftforge.mcmaven.impl.util.ProcessUtils;
+import net.minecraftforge.mcmaven.impl.util.Task;
+import net.minecraftforge.mcmaven.impl.util.Util;
+import net.minecraftforge.srgutils.IMappingFile;
+import net.minecraftforge.util.data.OS;
+import net.minecraftforge.util.data.json.JsonData;
+import net.minecraftforge.util.data.json.MCPConfig;
+import net.minecraftforge.util.file.FileUtils;
+import net.minecraftforge.util.hash.HashStore;
+import net.minecraftforge.util.logging.Log;
+import org.jetbrains.annotations.Nullable;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -18,9 +40,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.SequencedSet;
 import java.util.TreeSet;
 import java.util.function.BiPredicate;
 import java.util.function.Supplier;
@@ -33,30 +56,6 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
-
-import com.google.gson.reflect.TypeToken;
-import io.codechicken.diffpatch.cli.PatchOperation;
-import io.codechicken.diffpatch.util.LogLevel;
-import io.codechicken.diffpatch.util.PatchMode;
-import io.codechicken.diffpatch.util.Input.MultiInput;
-import io.codechicken.diffpatch.util.Output.MultiOutput;
-import io.codechicken.diffpatch.util.archiver.ArchiveFormat;
-import net.minecraftforge.mcmaven.impl.GlobalOptions;
-import net.minecraftforge.mcmaven.impl.cache.MavenCache;
-import net.minecraftforge.mcmaven.impl.util.Artifact;
-import net.minecraftforge.mcmaven.impl.util.Constants;
-import net.minecraftforge.util.data.OS;
-import net.minecraftforge.util.data.json.JsonData;
-import net.minecraftforge.util.data.json.MCPConfig;
-import net.minecraftforge.util.file.FileUtils;
-import net.minecraftforge.util.hash.HashStore;
-import net.minecraftforge.mcmaven.impl.util.ProcessUtils;
-import net.minecraftforge.mcmaven.impl.util.Task;
-import net.minecraftforge.mcmaven.impl.util.Util;
-import net.minecraftforge.srgutils.IMappingFile;
-import net.minecraftforge.util.logging.Log;
-import org.jetbrains.annotations.NotNull;
-import org.jetbrains.annotations.Nullable;
 
 // TODO [MCMavenizer][Documentation] Document
 public class MCPTaskFactory {
@@ -131,7 +130,7 @@ public class MCPTaskFactory {
         for (Map.Entry<String, String> entry : entries.entrySet()) {
             var key = entry.getKey();
             var value = entry.getValue();
-            data.put(key, Task.named("extract[" + key + ']', () -> extract(key, value)));
+            data.put(key, extract(key, value));
         }
 
         this.steps = cfg.getSteps(this.side.getName());
@@ -203,6 +202,7 @@ public class MCPTaskFactory {
 
     private static final BiPredicate<File, String> TRUE = (f, s) -> true;
     private static final BiPredicate<File, String> NOT_CONTAINS_CLIENT = (f, s) -> !s.contains("client");
+
     private BiPredicate<File, String> getFileFilter() {
         return this.side.containsClient() ? TRUE : NOT_CONTAINS_CLIENT;
     }
@@ -264,98 +264,101 @@ public class MCPTaskFactory {
         return ret;
     }
 
-    private File extract(String key, String value) {
+    private Task extract(String key, String value) {
         if (value.endsWith("/"))
             return extractFolder(key, value);
         return extractSingle(key, value);
     }
 
-    private File extractSingle(String key, String value) {
-        var idx = value.lastIndexOf('/');
-        var filename = idx == -1 ? value : value.substring(idx);
-        var target = new File(this.build, "data/" + key + '/' + filename);
+    private Task extractSingle(String key, String value) {
+        return Task.cachingFile("extract[%s]".formatted(key),
+            () -> {
+                var idx = value.lastIndexOf('/');
+                var filename = idx == -1 ? value : value.substring(idx);
+                return new File(this.build, "data/" + key + '/' + filename);
+            },
+            (callback, target) -> {
+                callback.setup(cache -> cache.add("mcp", getData()));
 
-        var cache = HashStore.fromFile(target);
-        cache.add("mcp", getData());
+                callback.run(cache -> {
+                    try (var zip = new ZipFile(getData())) {
+                        var entry = zip.getEntry(value);
+                        if (entry == null)
+                            throw except("Missing data: `" + key + "`: `" + value + "`");
 
-        if (target.exists() && cache.isSame())
-            return target;
+                        try (var os = new FileOutputStream(target)) {
+                            zip.getInputStream(entry).transferTo(os);
+                        }
+                        target.setLastModified(entry.getLastModifiedTime().toMillis());
 
-        GlobalOptions.assertNotCacheOnly();
-
-        try (var zip = new ZipFile(getData())) {
-            var entry = zip.getEntry(value);
-            if (entry == null)
-                throw except("Missing data: `" + key + "`: `" + value + "`");
-
-            FileUtils.ensureParent(target);
-
-            try (var os = new FileOutputStream(target)) {
-                zip.getInputStream(entry).transferTo(os);
+                        cache.save();
+                    } catch (IOException e) {
+                        throw except("Failed to extract `" + key + "`: `" + value + "`");
+                    }
+                });
             }
-
-            target.setLastModified(entry.getLastModifiedTime().toMillis());
-
-            cache.save();
-            return target;
-        } catch (IOException e) {
-            throw except("Failed to extract `" + key + "`: `" + value + "`");
-        }
+        );
     }
 
-    private File extractFolder(String key, String value) {
-        var base = new File(this.build, "data/" + key);
+    private Task extractFolder(String key, String value) {
+        return Task.cachingDir(
+            "extract[%s]".formatted(key),
+            new File(this.build, "data/" + key),
+            (callback, base) -> {
+                var existingFiles = FileUtils.listFiles(base);
 
-        var cache = new HashStore(base).load(new File(this.build, "data/" + key + ".cache"));
-        cache.add("mcp", getData());
-        boolean same = cache.isSame();
+                callback.setup(cache -> {
+                    cache.add("mcp", getData());
+                    cache.add(existingFiles);
+                });
 
-        var existing = new HashSet<>(FileUtils.listFiles(base));
+                callback.run(cache -> {
+                    var existing = new HashSet<>(existingFiles);
 
-        try (var zip = new ZipFile(getData())) {
-            var count = 0;
+                    try (var zip = new ZipFile(getData())) {
+                        var count = 0;
 
-            for (var itr = zip.entries(); itr.hasMoreElements(); ) {
-                var e = itr.nextElement();
-                if (e.isDirectory() || !e.getName().startsWith(value))
-                    continue;
+                        for (var itr = zip.entries(); itr.hasMoreElements(); ) {
+                            var e = itr.nextElement();
+                            if (e.isDirectory() || !e.getName().startsWith(value))
+                                continue;
 
-                count++;
+                            count++;
 
-                var relative = e.getName().substring(value.length());
-                var target = new File(base, relative);
-                existing.remove(target);
-                FileUtils.ensureParent(target);
+                            var relative = e.getName().substring(value.length());
+                            var target = new File(base, relative);
+                            existing.remove(target);
+                            FileUtils.ensureParent(target);
 
-                if (!target.exists() || !same) {
-                    GlobalOptions.assertNotCacheOnly();
-                    try (var os = new FileOutputStream(target)) {
-                        zip.getInputStream(e).transferTo(os);
+                            try (var os = new FileOutputStream(target)) {
+                                zip.getInputStream(e).transferTo(os);
+                            }
+                            target.setLastModified(e.getLastModifiedTime().toMillis());
+                        }
+
+                        // Delete files that were already in the target directory which we didn't extract
+                        var prefix = base.getAbsolutePath() + File.separator;
+                        for (var f : existing) {
+                            if (f.exists())
+                                f.delete();
+
+                            var parent = f.getAbsoluteFile().getParentFile();
+                            if (parent.listFiles().length == 0 &&
+                                f.getAbsolutePath().startsWith(prefix)) {
+                                parent.delete();
+                            }
+                        }
+
+                        if (count == 0)
+                            throw except("Missing data: `" + key + "`: `" + value + "`");
+
+                        cache.save();
+                    } catch (IOException e) {
+                        throw except("Failed to extract `" + key + "`: `" + value + "`");
                     }
-                    target.setLastModified(e.getLastModifiedTime().toMillis());
-                }
+                });
             }
-
-            // Delete files that were already in the target directory which we didn't extract
-            var prefix = base.getAbsolutePath() + File.separator;
-            for (var f : existing) {
-                if (f.exists())
-                    f.delete();
-
-                if (f.getParentFile().listFiles().length == 0 &&
-                    f.getAbsolutePath().startsWith(prefix)) {
-                    f.getParentFile().delete();
-                }
-            }
-
-            if (count == 0)
-                throw except("Missing data: `" + key + "`: `" + value + "`");
-
-            cache.save();
-            return base;
-        } catch (IOException e) {
-            throw except("Failed to extract `" + key + "`: `" + value + "`");
-        }
+        );
     }
 
     private Task createTask(Map<String, String> step) {
@@ -366,12 +369,12 @@ public class MCPTaskFactory {
 
         switch (type) {
             case "downloadManifest": return mc.launcherManifest;
-            case "downloadJson":     return mc.versionJson;
-            case "downloadClient":   return mc.versionFile("client", "jar");
-            case "downloadServer":   return mc.versionFile("server", "jar");
-            case "strip":            return strip(name, step);
-            case "inject":           return inject(name, step);
-            case "patch":            return patch(name, step);
+            case "downloadJson": return mc.versionJson;
+            case "downloadClient": return mc.versionFile("client", "jar");
+            case "downloadServer": return mc.versionFile("server", "jar");
+            case "strip": return strip(name, step);
+            case "inject": return inject(name, step);
+            case "patch": return patch(name, step);
             case "listLibraries":
                 if (spec >= 3 && step.containsKey("bundle"))
                     return listLibrariesBundle(name, step);
@@ -395,91 +398,77 @@ public class MCPTaskFactory {
 
     private Task strip(String name, Map<String, String> step) {
         var whitelist = "whitelist".equalsIgnoreCase(step.getOrDefault("mode", "whitelist"));
-        var output = new File(this.build, name + ".jar").getAbsoluteFile();
         var input = findStep(step.get("input"));
-        return Task.named(name,
-            Task.collect(input, (Supplier<Task>) () -> this.mappings),
-            () -> strip(input, whitelist, output)
+        return Task.cachingFile(name,
+            Task.deps(input, this.mappings),
+            new File(this.build, name + ".jar"),
+            (c, o) -> strip(c, o, input, whitelist)
         );
     }
 
-    private File strip(Task inputTask, boolean whitelist, File output) {
+    private void strip(Task.Cacheable.Callback callback, File output, Task inputTask, boolean whitelist) {
         var input = inputTask.execute();
         var mappings = this.mappings.execute();
 
-        var cache = HashStore.fromFile(output);
-        cache.add("input", input);
-        cache.add("mappings", mappings);
+        callback.setup(cache -> {
+            cache.add("input", input);
+            cache.add("mappings", mappings);
+        });
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.run(cache -> {
+            if (output.exists())
+                output.delete();
 
-        GlobalOptions.assertNotCacheOnly();
+            try {
+                var map = IMappingFile.load(mappings);
+                var classes = new HashSet<>();
+                for (var cls : map.getClasses())
+                    classes.add(cls.getOriginal() + ".class");
 
-        if (output.exists())
-            output.delete();
-
-        FileUtils.ensureParent(output);
-
-        try {
-            var map = IMappingFile.load(mappings);
-            var classes = new HashSet<>();
-            for (var cls : map.getClasses())
-                classes.add(cls.getOriginal() + ".class");
-
-            try (var is = new JarInputStream(new FileInputStream(input));
-                var os = new JarOutputStream(new FileOutputStream(output))) {
-               JarEntry entry;
-               while ((entry = is.getNextJarEntry()) != null) {
-                   if (entry.isDirectory() || classes.contains(entry.getName()) != whitelist)
-                       continue;
-                   os.putNextEntry(FileUtils.getStableEntry(entry));
-                   is.transferTo(os);
-                   os.closeEntry();
-               }
+                try (var is = new JarInputStream(new FileInputStream(input));
+                     var os = new JarOutputStream(new FileOutputStream(output))) {
+                    JarEntry entry;
+                    while ((entry = is.getNextJarEntry()) != null) {
+                        if (entry.isDirectory() || classes.contains(entry.getName()) != whitelist)
+                            continue;
+                        os.putNextEntry(FileUtils.getStableEntry(entry));
+                        is.transferTo(os);
+                        os.closeEntry();
+                    }
+                }
+            } catch (IOException e) {
+                throw new IOException("Failed to split " + input + " into output " + output, e);
             }
-
-            cache.save();
-            return output;
-       } catch (IOException e) {
-           return Util.sneak(new IOException("Failed to split " + input + " into output " + output, e));
-       }
+        });
     }
 
     private Task inject(String name, Map<String, String> step) {
         var input = findStep(step.get("input"));
         var inject = findData("inject");
-        var packages = new File(this.build, name + "/packages.jar").getAbsoluteFile();
-        var output = new File(this.build, name + "/output.jar").getAbsoluteFile();
-        return Task.named(name,
-            Set.of(input, inject),
-            () -> inject(input, inject, packages, output)
+        var packages = new File(this.build, name + "/packages.jar");
+        return Task.cachingFile(name,
+            Task.deps(input, inject),
+            new File(this.build, name + "/output.jar"),
+            (c, o) -> inject(c, o, input, inject, packages)
         );
     }
 
-    private File inject(Task inputTask, Task injectTask, File packages, File output) {
+    private void inject(Task.Cacheable.Callback callback, File output, Task inputTask, Task injectTask, File packages) {
         var input = inputTask.execute();
         var inject = injectTask.execute();
-        var cache = HashStore.fromFile(output);
-        cache.add("input", input);
-        cache.add("inject", inject);
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.setup(cache -> cache
+            .add("input", input)
+            .add("inject", inject));
 
-        GlobalOptions.assertNotCacheOnly();
+        callback.run(cache -> {
+            if (output.exists())
+                output.delete();
 
-        if (output.exists())
-            output.delete();
-
-        FileUtils.ensureParent(output);
-
-        var templateF = new File(input, "package-info-template.java");
-        String template = null;
-        try {
+            var templateF = new File(input, "package-info-template.java");
             if (templateF.exists()) {
                 var modified = templateF.lastModified();
-                template = Files.readString(templateF.toPath(), StandardCharsets.UTF_8);
+                var template = Files.readString(templateF.toPath(), StandardCharsets.UTF_8);
 
                 var pkgs = new TreeSet<String>();
                 try (var zip = new ZipInputStream(new FileInputStream(input))) {
@@ -513,51 +502,42 @@ public class MCPTaskFactory {
             } else {
                 FileUtils.mergeJars(output, false, this.injectFileFilter, input, inject);
             }
-
-            cache.save();
-            return output;
-        } catch (IOException e) {
-            return Util.sneak(e);
-        }
+        });
     }
 
     private Task patch(String name, Map<String, String> step) {
         var input = this.findStep(step.get("input"));
         var patches = this.findData("patches");
-        var output = new File(this.build, name + "/output.jar");
         var rejects = new File(this.build, name + "/rejects.jar");
-        return Task.named(name,
-            Set.of(input, patches),
-            () -> patch(input, patches, output, rejects)
+        return Task.cachingFile(name,
+            Task.deps(input, patches),
+            new File(this.build, name + "/output.jar"),
+            (c, o) -> patch(c, o, input, patches, rejects)
         );
     }
 
-    private File patch(Task inputTask, Task patchesTask, File output, File rejects) {
+    private void patch(Task.Cacheable.Callback callback, File output, Task inputTask, Task patchesTask, File rejects) {
         var input = inputTask.execute();
         var patches = patchesTask.execute();
-        var cache = HashStore.fromFile(output);
-        cache.add("input", input);
-        cache.add("patches", patches);
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.setup(cache -> cache
+            .add("input", input)
+            .add("patches", patches));
 
-        GlobalOptions.assertNotCacheOnly();
+        callback.run(cache -> {
+            var builder = PatchOperation
+                .builder()
+                .logTo(Log::error)
+                .baseInput(MultiInput.archive(ArchiveFormat.ZIP, input.toPath()))
+                .patchesInput(MultiInput.folder(patches.toPath()))
+                .patchedOutput(MultiOutput.archive(ArchiveFormat.ZIP, output.toPath()))
+                .rejectsOutput(MultiOutput.archive(ArchiveFormat.ZIP, rejects.toPath()))
+                .level(LogLevel.ERROR)
+                .mode(PatchMode.ACCESS)
+                //.aPrefix("a")
+                //.bPrefix("b")
+                ;
 
-        var builder = PatchOperation.builder()
-            .logTo(Log::error)
-            .baseInput(MultiInput.archive(ArchiveFormat.ZIP, input.toPath()))
-            .patchesInput(MultiInput.folder(patches.toPath()))
-            .patchedOutput(MultiOutput.archive(ArchiveFormat.ZIP, output.toPath()))
-            .rejectsOutput(MultiOutput.archive(ArchiveFormat.ZIP, rejects.toPath()))
-            .level(LogLevel.ERROR)
-            .mode(PatchMode.ACCESS)
-            //.aPrefix("a")
-            //.bPrefix("b")
-        ;
-
-        try {
-            FileUtils.ensureParent(output);
             FileUtils.ensureParent(rejects);
 
             var result = builder.build().operate();
@@ -571,78 +551,70 @@ public class MCPTaskFactory {
 
                 throw except("Failed to apply patches, Rejects saved to: " + rejects.getAbsolutePath());
             }
-
-            cache.save();
-            return output;
-        } catch (IOException e) {
-            return Util.sneak(e);
-        }
+        });
     }
 
     private Task listLibraries(String name, Map<String, String> step) {
-        var output = new File(this.build, name + ".txt");
-        var json = this.findStep("downloadJson");
-        return Task.named(name,
-            Set.of(json),
-            () -> listLibraries(json, output)
+        Task json = this.findStep("downloadJson");
+        return Task.cachingFile(name,
+            Task.deps(json),
+            new File(this.build, name + ".txt"),
+            (c, o) -> listLibraries(c, o, json)
         );
     }
 
-    private File listLibraries(Task jsonTask, File output) {
+    private void listLibraries(Task.Cacheable.Callback callback, File output, Task jsonTask) {
         var jsonF = jsonTask.execute();
         var json = JsonData.minecraftVersion(jsonF);
 
         var libs = json.getLibs();
-        var libsVarCache = new File(output.getAbsoluteFile().getParentFile(), "libraries.txt");
+        var libsVarCache = new File(output.getParentFile(), "libraries.txt");
 
-        var cache = HashStore.fromFile(output).add(jsonF).add(libsVarCache);
-        for (var lib : libs)
-            cache.addKnown(lib.coord, lib.dl.sha1);
+        callback.setup(cache -> {
+            cache.add(jsonF);
+            cache.add(libsVarCache);
+            for (var lib : libs)
+                cache.addKnown(lib.coord, lib.dl.sha1);
+        });
 
-        if (output.exists() && libsVarCache.exists() && cache.isSame()) {
+        callback.checkWith(condition -> condition.and(cache -> {
+            if (!libsVarCache.exists()) return false;
+
             this.libraries = JsonData.<List<Lib.Cached>>fromJson(libsVarCache, new TypeToken<>() { }).stream().map(Lib.Cached::resolve).toList();
-            return output;
-        }
+            return true;
+        }));
 
-        GlobalOptions.assertNotCacheOnly();
-        cache.clear().add(jsonF);
+        callback.run(cache -> {
+            cache.clear().add(jsonF);
 
-        var buf = new StringBuilder(20_000);
-        var minecraft = this.side.getMCP().getCache().minecraft();
-        var downloadedLibs = new ArrayList<Lib>();
-        for (var lib : libs) {
-            if (!lib.dl.url.toString().startsWith(Constants.MOJANG_MAVEN))
-                throw new IllegalStateException("Unable to download library " + lib.dl.path + " as it is not on Mojang's repo and I was lazy. " + lib.dl.url);
+            var buf = new StringBuilder(20_000);
+            var minecraft = this.side.getMCP().getCache().minecraft();
+            var downloadedLibs = new ArrayList<Lib>();
+            for (var lib : libs) {
+                if (!lib.dl.url.toString().startsWith(Constants.MOJANG_MAVEN))
+                    throw new IllegalStateException("Unable to download library " + lib.dl.path + " as it is not on Mojang's repo and I was lazy. " + lib.dl.url);
 
-            var target = minecraft.download(lib.dl);
+                var target = minecraft.download(lib.dl);
 
-            buf.append("-e=").append(target.getAbsolutePath()).append('\n');
+                buf.append("-e=").append(target.getAbsolutePath()).append('\n');
 
-            var artifact = Artifact.from(lib.coord);
-            if (lib.os != null && lib.os != OS.UNKNOWN)
-                artifact = artifact.withOS(lib.os);
+                var artifact = Artifact.from(lib.coord);
+                if (lib.os != null && lib.os != OS.UNKNOWN)
+                    artifact = artifact.withOS(lib.os);
 
-            downloadedLibs.add(new Lib(artifact, target));
-            cache.add(lib.coord, target);
-        }
+                downloadedLibs.add(new Lib(artifact, target));
+                cache.add(lib.coord, target);
+            }
 
-        try {
             FileUtils.ensureParent(libsVarCache);
             JsonData.toJson(downloadedLibs.stream().map(Lib::cacheable).toList(), libsVarCache);
             cache.add(libsVarCache);
-        } catch (IOException e) {
-            throw new RuntimeException(e);
-        }
-        this.libraries = downloadedLibs;
+            this.libraries = downloadedLibs;
 
-        FileUtils.ensureParent(output);
-        try (var os = new FileOutputStream(output)) {
-            os.write(buf.toString().getBytes(StandardCharsets.UTF_8));
-            cache.save();
-            return output;
-        } catch (IOException e) {
-            return Util.sneak(e);
-        }
+            try (var os = new FileOutputStream(output)) {
+                os.write(buf.toString().getBytes(StandardCharsets.UTF_8));
+            }
+        });
     }
 
     public record Lib(Artifact name, File file) {
@@ -668,53 +640,52 @@ public class MCPTaskFactory {
     private Task listLibrariesBundle(String name, Map<String, String> step) {
         var bundle = findStep(step.get("bundle"));
         var libraries = new File(this.build, name);
-        var output = new File(this.build, name + "/libraries.txt");
-        return Task.named(name,
-            Set.of(bundle),
-            () -> listLibrariesBundle(bundle, libraries, output)
+        return Task.cachingFile(name,
+            Task.deps(bundle),
+            new File(this.build, name + "/libraries.txt"),
+            (c, o) -> listLibrariesBundle(c, o, bundle, libraries)
         );
     }
 
-    private File listLibrariesBundle(Task bundleTask, File libraries, File output) {
+    private void listLibrariesBundle(Task.Cacheable.Callback callback, File output, Task bundleTask, File libraries) throws Exception {
         var bundle = bundleTask.execute();
 
-        try (var jar = new JarFile(bundle)) {
-            var format = jar.getManifest().getMainAttributes().getValue("Bundler-Format");
-            if (format == null)
-                throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Missing format entry from manifest");
+        var jar = new JarFile(bundle);
+        var format = jar.getManifest().getMainAttributes().getValue("Bundler-Format");
+        if (format == null)
+            throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Missing format entry from manifest");
 
-            if (!"1.0".equals(format))
-                throw new RuntimeException("Invalid bundle: `" + bundle + "` - Unsupported format " + format);
+        if (!"1.0".equals(format))
+            throw new RuntimeException("Invalid bundle: `" + bundle + "` - Unsupported format " + format);
 
-            var entry = jar.getEntry("META-INF/libraries.list");
-            if (entry == null)
-                throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Missing META-INF/libraries.list");
+        var libsListEntry = jar.getEntry("META-INF/libraries.list");
+        if (libsListEntry == null)
+            throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Missing META-INF/libraries.list");
 
-            record LibLine(String hash, Artifact artifact, String path) implements Comparable<LibLine> {
-                @Override
-                public int compareTo(LibLine o) {
-                    return Util.compare(this.artifact, o.artifact);
-                }
+        record LibLine(String hash, Artifact artifact, String path) implements Comparable<LibLine> {
+            @Override
+            public int compareTo(LibLine o) {
+                return Util.compare(this.artifact, o.artifact);
             }
-            var libs = new TreeSet<LibLine>();
+        }
+        var libs = new TreeSet<LibLine>();
 
-            var reader = new BufferedReader(new InputStreamReader(jar.getInputStream(entry)));
-            String line;
-            while ((line = reader.readLine()) != null) {
-                var pts = line.split("\t");
-                if (pts.length < 3)
-                    throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Invalid line: " + line);
-                libs.add(new LibLine(pts[0], Artifact.from(pts[1]),  pts[2]));
-            }
+        var reader = new BufferedReader(new InputStreamReader(jar.getInputStream(libsListEntry)));
+        String line;
+        while ((line = reader.readLine()) != null) {
+            var pts = line.split("\t");
+            if (pts.length < 3)
+                throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Invalid line: " + line);
+            libs.add(new LibLine(pts[0], Artifact.from(pts[1]), pts[2]));
+        }
 
-            var cache = HashStore.fromFile(output).add(bundle);
+        callback.setup(cache -> {
+            cache.add(bundle);
             for (var lib : libs)
                 cache.add(lib.artifact().toString(), new File(libraries, lib.path()));
+        });
 
-            if (output.exists() && cache.isSame())
-                return output;
-
-            GlobalOptions.assertNotCacheOnly();
+        callback.run(cache -> {
             cache.clear().add(bundle);
 
             var buf = new StringBuilder();
@@ -728,7 +699,7 @@ public class MCPTaskFactory {
 
                 downloadedLibs.add(new Lib(artifact, target));
                 if (!target.exists()) {
-                    entry = jar.getEntry("META-INF/libraries/" + lib.path());
+                    var entry = jar.getEntry("META-INF/libraries/" + lib.path());
                     if (entry == null)
                         throw new IllegalStateException("Invalid bundle: `" + bundle + "` - Missing META-INF/libraries/" + lib);
 
@@ -745,60 +716,48 @@ public class MCPTaskFactory {
 
             this.libraries = Collections.unmodifiableList(downloadedLibs);
 
-            FileUtils.ensureParent(output);
             try (var os = new FileOutputStream(output)) {
                 os.write(buf.toString().getBytes(StandardCharsets.UTF_8));
             }
-            cache.save();
-            return output;
-        } catch (IOException e) {
-            return Util.sneak(e);
-        }
+        });
+
+        callback.cleanup(didWork -> jar.close());
     }
 
     public Task getExtra() {
-        return Task.named("extra[" + this.side.getName() + ']',
-            Set.of(this.preStrip, this.mappings),
-            () -> getExtra(this.preStrip, mappings)
+        return Task.cachingFile("extra[" + this.side.getName() + ']',
+            Task.deps(this.preStrip, this.mappings),
+            new File(this.build, "extra.jar"),
+            this::getExtra
         );
     }
 
-    private File getExtra(Task prestripTask, Task mappingsTask) {
-        var prestrip = prestripTask.execute();
-        var mappings = mappingsTask.execute();
+    private void getExtra(Task.Cacheable.Callback callback, File output) {
+        var preStrip = this.preStrip.execute();
+        var mappings = this.mappings.execute();
 
-        var output = new File(this.build, "extra.jar");
+        callback.setup(cache -> {
+            cache.add("prestrip", preStrip);
+            cache.add("mappings", mappings);
+        });
 
-        var cache = HashStore.fromFile(output);
-        cache.add("prestrip", prestrip);
-        cache.add("mappings", mappings);
-
-        if (output.exists() && cache.isSame())
-            return output;
-
-        GlobalOptions.assertNotCacheOnly();
-
-        try {
+        callback.run(cache -> {
             var whitelist = IMappingFile
                 .load(mappings).getClasses().stream()
                 .map(IMappingFile.IClass::getOriginal)
                 .collect(Collectors.toSet());
-            FileUtils.splitJar(prestrip, whitelist, output, false, false);
-        } catch (IOException e) {
-            Util.sneak(e);
-        }
-
-        cache.save();
-        return output;
+            FileUtils.splitJar(preStrip, whitelist, output, false, false);
+        });
     }
 
     private Task execute(String name, Map<String, String> step, MCPConfig.Function func) {
         var args = new HashMap<String, TaskOrArg>();
-        var deps = new HashSet<Task>();
+        var deps = new LinkedHashSet<Task>();
 
         // Find any inputs from previous tasks
-        for (var key : step.keySet()) {
-            var value = step.get(key);
+        for (var entry : step.entrySet()) {
+            var key = entry.getKey();
+            var value = entry.getValue();
             if (isVariable(value)) {
                 var task = value.endsWith("Output}") ? findStep(value) : findData(value);
                 deps.add(task);
@@ -819,51 +778,49 @@ public class MCPTaskFactory {
         var jvmArgs = fillArgs(func.jvmargs, args, deps);
         var runArgs = fillArgs(func.args, args, deps);
 
-        return Task.named(name, deps,
-            () -> execute(jvmArgs, runArgs, func, log, output)
+        return Task.cachingFile(name, Task.deps(deps), output,
+            (c, o) -> execute(c, jvmArgs, runArgs, func, log)
         );
     }
 
-    private File execute(List<TaskOrArg> jvmArgs, List<TaskOrArg> runArgs, MCPConfig.Function func, File log, File output) {
+    private void execute(Task.Cacheable.Callback callback, List<TaskOrArg> jvmArgs, List<TaskOrArg> runArgs, MCPConfig.Function func, File log) {
         // First download the tool
         var maven = new MavenCache("mcp-tools", func.repo, this.side.getMCP().getCache().root());
         var toolA = Artifact.from(func.version);
         var tool = maven.download(toolA);
 
-        var cache = HashStore.fromFile(output);
-        cache.add("tool", tool);
-        cache.add("jvm-args", jvmArgs.stream().map(TaskOrArg::name).collect(Collectors.joining(" ")));
-        cache.add("run-args", runArgs.stream().map(TaskOrArg::name).collect(Collectors.joining(" ")));
         var tasks = new HashMap<Task, String>();
-        var jvm = resolveArgs(cache, tasks, jvmArgs);
-        var run = resolveArgs(cache, tasks, runArgs);
+        var jvm = new ArrayList<String>();
+        var run = new ArrayList<String>();
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.setup(cache -> {
+            cache.add("tool", tool);
+            cache.add("jvm-args", jvmArgs.stream().map(TaskOrArg::name).collect(Collectors.joining(" ")));
+            cache.add("run-args", runArgs.stream().map(TaskOrArg::name).collect(Collectors.joining(" ")));
+            resolveArgs(jvm, cache, tasks, jvmArgs);
+            resolveArgs(run, cache, tasks, runArgs);
+        });
 
-        GlobalOptions.assertNotCacheOnly();
+        callback.run(cache -> {
+            int java_version = func.getJavaVersion(this.side.getMCP().getConfig());
+            var jdks = this.side.getMCP().getCache().jdks();
+            var jdk = jdks.get(java_version);
+            if (jdk == null)
+                throw new IllegalStateException("Failed to find JDK for version " + java_version);
 
-        int java_version = func.getJavaVersion(this.side.getMCP().getConfig());
-        var jdks = this.side.getMCP().getCache().jdks();
-        var jdk = jdks.get(java_version);
-        if (jdk == null)
-            throw new IllegalStateException("Failed to find JDK for version " + java_version);
-
-        var ret = ProcessUtils.runJar(jdk, log.getParentFile(), log, tool, jvm, run);
-        if (ret.exitCode != 0)
-            throw new IllegalStateException("Failed to run MCP Step, See log: " + log.getAbsolutePath());
-
-        cache.save();
-        return output;
+            var ret = ProcessUtils.runJar(jdk, log.getParentFile(), log, tool, jvm, run);
+            if (ret.exitCode != 0)
+                throw new IllegalStateException("Failed to run MCP Step, See log: " + log.getAbsolutePath());
+        });
     }
 
     private boolean isVariable(String value) {
         return value.startsWith("{") && value.endsWith("}");
     }
 
-    private record TaskOrArg(String name, Task task, String value) {}
+    private record TaskOrArg(String name, Task task, String value) { }
 
-    private List<TaskOrArg> fillArgs(List<String> lst, Map<String, TaskOrArg> args, Set<Task> deps) {
+    private List<TaskOrArg> fillArgs(List<String> lst, Map<String, TaskOrArg> args, SequencedSet<Task> deps) {
         if (lst == null)
             return List.of();
 
@@ -885,8 +842,7 @@ public class MCPTaskFactory {
         return ret;
     }
 
-    private List<String> resolveArgs(HashStore cache, Map<Task, String> tasks, List<TaskOrArg> args) {
-        var ret = new ArrayList<String>();
+    private List<String> resolveArgs(ArrayList<String> ret, HashStore cache, Map<Task, String> tasks, List<TaskOrArg> args) {
         for (var toa : args) {
             if (toa.task() == null)
                 ret.add(toa.value());

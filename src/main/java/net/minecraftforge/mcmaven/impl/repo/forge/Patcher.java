@@ -4,13 +4,36 @@
  */
 package net.minecraftforge.mcmaven.impl.repo.forge;
 
+import io.codechicken.diffpatch.cli.PatchOperation;
+import io.codechicken.diffpatch.util.Input.MultiInput;
+import io.codechicken.diffpatch.util.LogLevel;
+import io.codechicken.diffpatch.util.Output.MultiOutput;
+import io.codechicken.diffpatch.util.PatchMode;
+import io.codechicken.diffpatch.util.archiver.ArchiveFormat;
+import net.minecraftforge.mcmaven.impl.GlobalOptions;
+import net.minecraftforge.mcmaven.impl.cache.Cache;
+import net.minecraftforge.mcmaven.impl.cache.MavenCache;
+import net.minecraftforge.mcmaven.impl.repo.mcpconfig.MCP;
+import net.minecraftforge.mcmaven.impl.repo.mcpconfig.MCPSide;
+import net.minecraftforge.mcmaven.impl.util.Artifact;
+import net.minecraftforge.mcmaven.impl.util.Constants;
+import net.minecraftforge.mcmaven.impl.util.ProcessUtils;
+import net.minecraftforge.mcmaven.impl.util.Task;
+import net.minecraftforge.mcmaven.impl.util.Util;
+import net.minecraftforge.util.data.json.JsonData;
+import net.minecraftforge.util.data.json.PatcherConfig;
+import net.minecraftforge.util.file.FileUtils;
+import net.minecraftforge.util.hash.HashFunction;
+import net.minecraftforge.util.hash.HashStore;
+import net.minecraftforge.util.logging.Log;
+import org.jetbrains.annotations.Nullable;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -21,39 +44,16 @@ import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.zip.ZipFile;
 
-import io.codechicken.diffpatch.cli.PatchOperation;
-import io.codechicken.diffpatch.util.LogLevel;
-import io.codechicken.diffpatch.util.PatchMode;
-import io.codechicken.diffpatch.util.Input.MultiInput;
-import io.codechicken.diffpatch.util.Output.MultiOutput;
-import io.codechicken.diffpatch.util.archiver.ArchiveFormat;
-import net.minecraftforge.mcmaven.impl.GlobalOptions;
-import net.minecraftforge.mcmaven.impl.cache.Cache;
-import net.minecraftforge.mcmaven.impl.cache.MavenCache;
-import net.minecraftforge.mcmaven.impl.repo.mcpconfig.MCP;
-import net.minecraftforge.mcmaven.impl.repo.mcpconfig.MCPSide;
-import net.minecraftforge.mcmaven.impl.util.Artifact;
-import net.minecraftforge.mcmaven.impl.util.Constants;
-import net.minecraftforge.util.data.json.JsonData;
-import net.minecraftforge.util.data.json.PatcherConfig;
-import net.minecraftforge.util.file.FileUtils;
-import net.minecraftforge.util.hash.HashFunction;
-import net.minecraftforge.util.hash.HashStore;
-import net.minecraftforge.mcmaven.impl.util.ProcessUtils;
-import net.minecraftforge.mcmaven.impl.util.Task;
-import net.minecraftforge.mcmaven.impl.util.Util;
-import net.minecraftforge.util.logging.Log;
-import org.jetbrains.annotations.Nullable;
-
 // TODO: [MCMavenizer] This class needs to be split off into some sort of abstract class so that other patching processes can be implemented.
 // The current way this is implemented by trying to parse a specific config is not that great. And if we want to support other versions, this HAS to be abstracted.
+
 /**
- * This class is responsible for the <strong>entire</strong> patching process.
- * It continues work after MCP has decompiled the game.
- *
- * After construction the 'last' task will be the final task that produces source files ready to be recompiled.
- * These files may or may not be in SRG names, depending on the patcher configuration.
- * But the point is this creates source code.
+ * This class is responsible for the <strong>entire</strong> patching process. It continues work after MCP has
+ * decompiled the game.
+ * <p>
+ * After construction the 'last' task will be the final task that produces source files ready to be recompiled. These
+ * files may or may not be in SRG names, depending on the patcher configuration. But the point is this creates source
+ * code.
  */
 public class Patcher implements Supplier<Task> {
     private final File build;
@@ -93,7 +93,7 @@ public class Patcher implements Supplier<Task> {
         if (this.config.sources == null) {
             this.downloadSources = null;
         } else {
-            this.downloadSources = Task.named("downloadSources", () -> {
+            this.downloadSources = Task.simple("downloadSources", () -> {
                 var art = Artifact.from(this.config.sources);
                 var ret = this.forge.getCache().maven().download(art);
                 if (ret == null)
@@ -132,12 +132,18 @@ public class Patcher implements Supplier<Task> {
 
             if (ats != null) {
                 var tmp = predecomp;
-                predecomp = Task.named("modifyAccess", Set.of(tmp), () -> modifyAccess(dir, tmp, ats, cache));
+                predecomp = Task.cachingFile("modifyAccess",
+                    Task.deps(tmp),
+                    new File(dir, "modifyAccess.jar"),
+                    (c, o) -> modifyAccess(c, o, dir, tmp, ats, cache));
             }
 
             if (sass != null) {
                 var tmp = predecomp;
-                predecomp = Task.named("stripSides", Set.of(tmp), () -> stripSides(dir, tmp, sass, cache));
+                predecomp = Task.cachingFile("stripSides",
+                    Task.deps(tmp),
+                    new File(dir, "stripSides.jar"),
+                    (c, o) -> stripSides(c, o, dir, tmp, sass, cache));
             }
 
             // If we changed the decompile input, rebuild decompile and subsequent tasks
@@ -351,7 +357,7 @@ public class Patcher implements Supplier<Task> {
                     throw new IllegalStateException("Invalid Patcher configuation, Missing Data: " + file);
 
                 if (!first)
-                    out.write(new byte[] { '\r', '\n' });
+                    out.write(new byte[] {'\r', '\n'});
                 else
                     first = false;
 
@@ -369,112 +375,95 @@ public class Patcher implements Supplier<Task> {
 
     private Task extractSingle(String key, String value) {
         return this.extracts.computeIfAbsent(value, k ->
-            Task.named("extract[" + key + ']', () -> extractSingleTask(key, value))
+            Task.cachingFile("extract[" + key + ']',
+                () -> {
+                    var idx = value.lastIndexOf('/');
+                    var filename = idx == -1 ? value : value.substring(idx);
+                    return new File(this.build, "data/" + key + '/' + filename);
+                },
+                (callback, output) -> extractSingleTask(callback, output, key, value))
         );
     }
 
-    private File extractSingleTask(String key, String value) {
-        var idx = value.lastIndexOf('/');
-        var filename = idx == -1 ? value : value.substring(idx);
-        var target = new File(this.build, "data/" + key + '/' + filename);
+    private void extractSingleTask(Task.Cacheable.Callback callback, File target, String key, String value) {
+        callback.setup(cache -> cache.add("data", this.data));
 
-        var cache = HashStore.fromFile(target);
-        cache.add("data", this.data);
+        callback.run(cache -> {
+            try (var zip = new ZipFile(this.data)) {
+                var entry = zip.getEntry(value);
+                if (entry == null)
+                    throw except("Missing data: `" + key + "`: `" + value + "`");
 
-        if (target.exists() && cache.isSame())
-            return target;
+                FileUtils.ensureParent(target);
 
-        GlobalOptions.assertNotCacheOnly();
+                try (var os = new FileOutputStream(target)) {
+                    zip.getInputStream(entry).transferTo(os);
+                }
 
-        try (var zip = new ZipFile(this.data)) {
-            var entry = zip.getEntry(value);
-            if (entry == null)
-                throw except("Missing data: `" + key + "`: `" + value + "`");
-
-            FileUtils.ensureParent(target);
-
-            try (var os = new FileOutputStream(target)) {
-                zip.getInputStream(entry).transferTo(os);
+                target.setLastModified(entry.getLastModifiedTime().toMillis());
+            } catch (IOException e) {
+                throw except("Failed to extract `" + key + "`: `" + value + "`", e);
             }
-
-            target.setLastModified(entry.getLastModifiedTime().toMillis());
-
-            cache.save();
-            return target;
-        } catch (IOException e) {
-            throw except("Failed to extract `" + key + "`: `" + value + "`", e);
-        }
+        });
     }
 
-    public static File modifyAccess(File globalBase, Task inputTask, File cfg, Cache dlCache) {
+    public static void modifyAccess(Task.Cacheable.Callback callback, File output, File globalBase, Task inputTask, File cfg, Cache dlCache) {
         var input = inputTask.execute();
         var tool = dlCache.maven().download(Constants.ACCESS_TRANSFORMER);
 
-        var output = new File(globalBase, "modifyAccess.jar");
-        var log    = new File(globalBase, "modifyAccess.log");
+        var log = new File(globalBase, "modifyAccess.log");
 
-        var cache = HashStore.fromFile(output);
-        cache.add("tool", tool);
-        cache.add("input", input);
-        cache.add("cfg", cfg);
+        callback.setup(cache -> {
+            cache.add("tool", tool);
+            cache.add("input", input);
+            cache.add("cfg", cfg);
+        });
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.run(cache -> {
+            var args = List.of(
+                "--inJar", input.getAbsolutePath(),
+                "--atfile", cfg.getAbsolutePath(),
+                "--outJar", output.getAbsolutePath()
+            );
 
-        GlobalOptions.assertNotCacheOnly();
+            var jdk = dlCache.jdks().get(Constants.ACCESS_TRANSFORMER_JAVA_VERSION);
+            if (jdk == null)
+                throw new IllegalStateException("Failed to find JDK for version " + Constants.ACCESS_TRANSFORMER_JAVA_VERSION);
 
-        var args = List.of(
-            "--inJar", input.getAbsolutePath(),
-            "--atfile", cfg.getAbsolutePath(),
-            "--outJar", output.getAbsolutePath()
-        );
-
-        var jdk = dlCache.jdks().get(Constants.ACCESS_TRANSFORMER_JAVA_VERSION);
-        if (jdk == null)
-            throw new IllegalStateException("Failed to find JDK for version " + Constants.ACCESS_TRANSFORMER_JAVA_VERSION);
-
-        var ret = ProcessUtils.runJar(jdk, globalBase, log, tool, Collections.emptyList(), args);
-        if (ret.exitCode != 0)
-            throw new IllegalStateException("Failed to run Access Transformer, See log: " + log.getAbsolutePath());
-
-        cache.save();
-        return output;
+            var ret = ProcessUtils.runJar(jdk, globalBase, log, tool, Collections.emptyList(), args);
+            if (ret.exitCode != 0)
+                throw new IllegalStateException("Failed to run Access Transformer, See log: " + log.getAbsolutePath());
+        });
     }
 
-    public static File stripSides(File globalBase, Task inputTask, File cfg, Cache dlCache) {
+    public static void stripSides(Task.Cacheable.Callback callback, File output, File globalBase, Task inputTask, File cfg, Cache dlCache) {
         var input = inputTask.execute();
         var tool = dlCache.maven().download(Constants.SIDE_STRIPPER);
-        var output = new File(globalBase, "stripSides.jar");
-        var log    = new File(globalBase, "stripSides.log");
-        var cache = HashStore.fromFile(output);
-        cache.add("tool", tool);
-        cache.add("input", input);
-        cache.add("cfg", cfg);
+        var log = new File(globalBase, "stripSides.log");
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.setup(cache -> cache
+            .add("tool", tool)
+            .add("input", input)
+            .add("cfg", cfg));
 
-        GlobalOptions.assertNotCacheOnly();
+        callback.run(cache -> {
+            var args = new ArrayList<String>();
+            args.add("--strip");
+            args.add("--input");
+            args.add(input.getAbsolutePath());
+            args.add("--data");
+            args.add(cfg.getAbsolutePath());
+            args.add("--output");
+            args.add(output.getAbsolutePath());
 
-        var args = new ArrayList<String>();
-        args.add("--strip");
-        args.add("--input");
-        args.add(input.getAbsolutePath());
-        args.add("--data");
-        args.add(cfg.getAbsolutePath());
-        args.add("--output");
-        args.add(output.getAbsolutePath());
+            var jdk = dlCache.jdks().get(Constants.SIDE_STRIPPER_JAVA_VERSION);
+            if (jdk == null)
+                throw new IllegalStateException("Failed to find JDK for version " + Constants.SIDE_STRIPPER_JAVA_VERSION);
 
-        var jdk = dlCache.jdks().get(Constants.SIDE_STRIPPER_JAVA_VERSION);
-        if (jdk == null)
-            throw new IllegalStateException("Failed to find JDK for version " + Constants.SIDE_STRIPPER_JAVA_VERSION);
-
-        var ret = ProcessUtils.runJar(jdk, globalBase, log, tool, Collections.emptyList(), args);
-        if (ret.exitCode != 0)
-            throw new IllegalStateException("Failed to run Side Stripper, See log: " + log.getAbsolutePath());
-
-        cache.save();
-        return output;
+            var ret = ProcessUtils.runJar(jdk, globalBase, log, tool, Collections.emptyList(), args);
+            if (ret.exitCode != 0)
+                throw new IllegalStateException("Failed to run Side Stripper, See log: " + log.getAbsolutePath());
+        });
     }
 
     private Task completeMcp(File globalBase, Task inputTask) {
@@ -487,19 +476,20 @@ public class Patcher implements Supplier<Task> {
         var data = this.config.processor;
         var output = new File(outputDir, "post-processed.jar");
         var log = new File(outputDir, "post-processed.log");
-        var deps = new HashSet<Task>();
+        var deps = new ArrayList<Task>();
         deps.add(input);
 
         for (var entry : data.data.entrySet())
             deps.add(extractSingle(entry.getKey(), entry.getValue()));
 
-        return Task.named("postProcess[" + this.name.getName() + ']',
-            deps,
-            () -> postProcess(input, data, output, log)
+        return Task.cachingFile("postProcess[" + this.name.getName() + ']',
+            Task.deps(deps),
+            output,
+            (c, o) -> postProcess(c, o, input, data, log)
         );
     }
 
-    private File postProcess(Task inputTask, PatcherConfig.V2.DataFunction data, File output, File log) {
+    private void postProcess(Task.Cacheable.Callback callback, File output, Task inputTask, PatcherConfig.V2.DataFunction data, File log) {
         var input = inputTask.execute();
 
         // First download the tool
@@ -507,86 +497,77 @@ public class Patcher implements Supplier<Task> {
         var toolA = Artifact.from(data.version);
         var tool = maven.download(toolA);
 
-        var cache = HashStore.fromFile(output);
-        cache.add("data", this.data);
-        cache.add("tool", tool);
-        cache.add("input", input);
-        cache.add("jvm-args", data.getJvmArgs().stream().collect(Collectors.joining(" ")));
-        cache.add("run-args", data.getArgs().stream().collect(Collectors.joining(" ")));
-
-        // Extract any needed data
         var files = new HashMap<String, String>();
-        files.put("{input}", input.getAbsolutePath());
-        files.put("{output}", output.getAbsolutePath());
-        for (var entry : data.data.entrySet()) {
-            var extract = extractSingle(entry.getKey(), entry.getValue());
-            var file = extract.execute();
-            files.put('{' + entry.getKey() + '}', file.getAbsolutePath());
-            cache.add(entry.getKey(), file);
-        }
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.setup(cache -> {
+            cache.add("data", this.data)
+                 .add("tool", tool)
+                 .add("input", input)
+                 .add("jvm-args", data.getJvmArgs().stream().collect(Collectors.joining(" ")))
+                 .add("run-args", data.getArgs().stream().collect(Collectors.joining(" ")));
 
-        GlobalOptions.assertNotCacheOnly();
+            // Extract any needed data
+            files.put("{input}", input.getAbsolutePath());
+            files.put("{output}", output.getAbsolutePath());
+            for (var entry : data.data.entrySet()) {
+                var extract = extractSingle(entry.getKey(), entry.getValue());
+                var file = extract.execute();
+                files.put('{' + entry.getKey() + '}', file.getAbsolutePath());
+                cache.add(entry.getKey(), file);
+            }
+        });
 
-        var args = new ArrayList<String>();
-        for (var arg : data.getArgs())
-            args.add(files.getOrDefault(arg, arg));
+        callback.run(cache -> {
+            var args = new ArrayList<String>();
+            for (var arg : data.getArgs())
+                args.add(files.getOrDefault(arg, arg));
 
-        int java_version = data.getJavaVersion(this.getMCP().getConfig());
-        var jdks = this.getMCP().getCache().jdks();
-        var jdk = jdks.get(java_version);
-        if (jdk == null)
-            throw new IllegalStateException("Failed to find JDK for version " + java_version);
+            int java_version = data.getJavaVersion(this.getMCP().getConfig());
+            var jdks = this.getMCP().getCache().jdks();
+            var jdk = jdks.get(java_version);
+            if (jdk == null)
+                throw new IllegalStateException("Failed to find JDK for version " + java_version);
 
-
-        var ret = ProcessUtils.runJar(jdk, log.getParentFile(), log, tool, data.getJvmArgs(), args);
-        if (ret.exitCode != 0)
-            throw new IllegalStateException("Failed to run MCP Step, See log: " + log.getAbsolutePath());
-
-        cache.save();
-        return output;
+            var ret = ProcessUtils.runJar(jdk, log.getParentFile(), log, tool, data.getJvmArgs(), args);
+            if (ret.exitCode != 0)
+                throw new IllegalStateException("Failed to run MCP Step, See log: " + log.getAbsolutePath());
+        });
     }
 
     private Task patch(Task input, File outputDir) {
         var output = new File(outputDir, "patched.jar");
         var rejects = new File(outputDir, "patched-rejects.jar");
-        return Task.named("patch[" + this.name.getName() + ']',
-            Set.of(input),
-            () -> patch(input, output, rejects)
+        return Task.cachingFile("patch[" + this.name.getName() + ']',
+            Task.deps(input),
+            output,
+            (c, o) -> patch(c, o, input, rejects)
         );
     }
 
-    private File patch(Task inputTask, File output, File rejects) {
+    private void patch(Task.Cacheable.Callback callback, File output, Task inputTask, File rejects) {
         var input = inputTask.execute();
 
-        var cache = HashStore.fromFile(output);
-        cache.add("input", input);
-        cache.add("data", this.data);
+        callback.setup(cache -> cache
+            .add("input", input)
+            .add("data", this.data));
 
-        if (output.exists() && cache.isSame())
-            return output;
+        callback.run(cache -> {
+            var builder = PatchOperation
+                .builder()
+                .logTo(Log::error)
+                .baseInput(MultiInput.archive(ArchiveFormat.ZIP, input.toPath()))
+                .patchesInput(MultiInput.archive(ArchiveFormat.ZIP, this.data.toPath()))
+                .patchedOutput(MultiOutput.archive(ArchiveFormat.ZIP, output.toPath()))
+                .rejectsOutput(MultiOutput.archive(ArchiveFormat.ZIP, rejects.toPath()))
+                .level(LogLevel.ERROR)
+                .mode(PatchMode.ACCESS)
+                .patchesPrefix(this.config.patches);
 
-        GlobalOptions.assertNotCacheOnly();
+            if (this.config.patchesOriginalPrefix != null)
+                builder = builder.aPrefix(this.config.patchesOriginalPrefix);
+            if (this.config.patchesModifiedPrefix != null)
+                builder = builder.bPrefix(this.config.patchesModifiedPrefix);
 
-        var builder = PatchOperation.builder()
-            .logTo(Log::error)
-            .baseInput(MultiInput.archive(ArchiveFormat.ZIP, input.toPath()))
-            .patchesInput(MultiInput.archive(ArchiveFormat.ZIP, this.data.toPath()))
-            .patchedOutput(MultiOutput.archive(ArchiveFormat.ZIP, output.toPath()))
-            .rejectsOutput(MultiOutput.archive(ArchiveFormat.ZIP, rejects.toPath()))
-            .level(LogLevel.ERROR)
-            .mode(PatchMode.ACCESS)
-            .patchesPrefix(this.config.patches)
-        ;
-
-        if (this.config.patchesOriginalPrefix != null)
-            builder = builder.aPrefix(this.config.patchesOriginalPrefix);
-        if (this.config.patchesModifiedPrefix != null)
-            builder = builder.bPrefix(this.config.patchesModifiedPrefix);
-
-        try {
             var result = builder.build().operate();
 
             boolean success = result.exit == 0;
@@ -598,48 +579,31 @@ public class Patcher implements Supplier<Task> {
 
                 throw except("Failed to apply patches, rejects saved to: " + rejects.getAbsolutePath());
             }
-
-            cache.save();
-            return output;
-        } catch (IOException e) {
-            return Util.sneak(e);
-        }
+        });
     }
 
     private Task injectSources(Task input, File outputDir) {
         if (this.downloadSources == null)
             return input;
 
-        var output = new File(outputDir, "injected-sources.jar");
-        return Task.named("injectSources[" + this.name.getName() + ']',
-            Set.of(input, this.downloadSources),
-            () -> injectSourcesImpl(input, output)
+        return Task.cachingFile("injectSources[" + this.name.getName() + ']',
+            Task.deps(input, this.downloadSources),
+            new File(outputDir, "injected-sources.jar"),
+            (callback, output) -> injectSourcesImpl(callback, output, input)
         );
     }
 
-    private File injectSourcesImpl(Task inputTask, File output) {
+    private void injectSourcesImpl(Task.Cacheable.Callback callback, File output, Task inputTask) {
         var input = inputTask.execute();
         var sources = this.downloadSources.execute();
 
-        var cache = HashStore.fromFile(output);
-        cache.add("input", input);
-        cache.add("sources", sources);
+        callback.setup(cache -> cache
+            .add("input", input)
+            .add("sources", sources));
 
-        if (output.exists() && cache.isSame())
-            return output;
-
-        GlobalOptions.assertNotCacheOnly();
-
-        try {
-            FileUtils.mergeJars(output, false,
-                (file, path) -> file != sources || !path.startsWith("patches/"),
-                sources, input
-            );
-        } catch (IOException e) {
-            return Util.sneak(e);
-        }
-
-        cache.save();
-        return output;
+        callback.run(cache -> FileUtils.mergeJars(output, false,
+            (file, path) -> file != sources || !path.startsWith("patches/"),
+            sources, input
+        ));
     }
 }

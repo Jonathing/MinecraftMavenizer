@@ -13,7 +13,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Function;
 import java.util.zip.Deflater;
@@ -31,9 +30,7 @@ import net.minecraftforge.mcmaven.impl.util.Constants;
 import net.minecraftforge.mcmaven.impl.util.Task;
 import net.minecraftforge.mcmaven.impl.util.Util;
 import net.minecraftforge.srgutils.IMappingFile;
-import net.minecraftforge.util.file.FileUtils;
-import net.minecraftforge.util.hash.HashStore;
-import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.NotNull;
 
 public class ParchmentMappings extends Mappings {
     private Task downloadTask;
@@ -42,6 +39,12 @@ public class ParchmentMappings extends Mappings {
         super("parchment", Objects.requireNonNull(version, "Parchment mappings version must be present"));
         if (version.contains("-SNAPSHOT"))
             throw new IllegalArgumentException("Parchment snapshots are not supported: " + version);
+    }
+
+    @SuppressWarnings("DataFlowIssue") // not-null enforced in constructor
+    @Override
+    public @NotNull String version() {
+        return super.version();
     }
 
     @Override
@@ -63,16 +66,19 @@ public class ParchmentMappings extends Mappings {
         if (ret != null)
             return ret;
 
-        var mc = side.getMCP().getMinecraftTasks();
+        var mcp = side.getMCP();
+        var mc = mcp.getMinecraftTasks();
         var srg = side.getTasks().getMappings();
 
         var client = mc.versionFile("client_mappings", "txt");
         var server = mc.versionFile("server_mappings", "txt");
-        var data = downloadTask(side.getMCP());
+        var data = downloadTask(mcp);
 
-        ret = Task.named("srg2names[" + this + ']',
-            Set.of(srg, client, server, data).stream().filter(e -> e != null).toList(),
-            () -> getMappings(side.getMCP(), srg, client, server, data)
+        var root = getFolder(new File(mcp.getBuildFolder(), "data/mapings"));
+        ret = Task.cachingFile("srg2names[" + this + ']',
+            Task.deps(srg, client, server, data),
+            new File(root, "parchment" + version() + ".zip"),
+            (c, o) -> getMappings(c, o, srg, client, server, data)
         );
         tasks.put(side, ret);
 
@@ -81,8 +87,7 @@ public class ParchmentMappings extends Mappings {
 
     private Task downloadTask(MCP mcp) {
         if (downloadTask == null) {
-            downloadTask = Task.named("download[" + version() + "][parchment]",
-                Set.of(),
+            downloadTask = Task.simple("download[" + version() + "][parchment]",
                 () -> download(mcp.getCache())
             );
         }
@@ -100,84 +105,73 @@ public class ParchmentMappings extends Mappings {
         return maven.download(artifact);
     }
 
-    private File getMappings(MCP mcp, Task srgTask, Task clientTask, Task serverTask, Task dataTask) throws IOException {
+    private void getMappings(Task.Cacheable.Callback callback, File output, Task srgTask, Task clientTask, Task serverTask, Task dataTask) throws IOException {
         var srg = srgTask.execute();
         var client = clientTask.execute();
         var server = serverTask.execute();
         var data = dataTask.execute();
 
-        var root = getFolder(new File(mcp.getBuildFolder(), "data/mapings"));
-        var output = new File(root, "parchment" + version() + ".zip");
-        var cache = HashStore.fromFile(output)
+        callback.setup(cache -> cache
             .add("srg", srg)
             .add("client", client)
             .add("server", server)
-            .add("data", data);
+            .add("data", data));
 
+        callback.run(cache -> {
+            ParchmentData json;
+            try (var zip = new ZipFile(data)) {
+                var entry = zip.getEntry("parchment.json");
+                if (entry == null)
+                    throw new IllegalStateException("Invalid parchment data archive, missing parchment.json: " + data.getAbsolutePath());
+                json = ParchmentData.load(zip.getInputStream(entry));
+                json.bake();
+            }
 
-        if (output.exists() && cache.isSame())
-            return output;
+            var obf2mojClient = IMappingFile.load(client).reverse();
+            var obf2mojServer = IMappingFile.load(server).reverse();
 
-        ParchmentData json = null;
-        try (var zip = new ZipFile(data)) {
-            var entry = zip.getEntry("parchment.json");
-            if (entry == null)
-                throw new IllegalStateException("Invalid parchment data archive, missing parchment.json: " + data.getAbsolutePath());
-            json = ParchmentData.load(zip.getInputStream(entry));
-            json.bake();
-        } catch (IOException e) {
-            Util.sneak(e);
-        }
+            var obf2srg = IMappingFile.load(srg);
 
-        var obf2mojClient = IMappingFile.load(client).reverse();
-        var obf2mojServer = IMappingFile.load(server).reverse();
+            var clientData = gather(obf2srg, obf2mojClient, json, true);
+            var serverData = gather(obf2srg, obf2mojServer, json, false);
 
-        var obf2srg = IMappingFile.load(srg);
-
-        var clientData = gather(obf2srg, obf2mojClient, json, true);
-        var serverData = gather(obf2srg, obf2mojServer, json, false);
-
-        record Type(String file, Function<SideData, Map<String, Info>> data) {}
-        var types = new Type[] {
-            new Type("packages.csv", SideData::packages),
-            new Type("classes.csv", SideData::classes),
-            new Type("fields.csv", SideData::fields),
-            new Type("methods.csv", SideData::methods),
-            new Type("params.csv", SideData::params)
-        };
-
-
-        FileUtils.ensureParent(output);
-        try (var fos = new FileOutputStream(output);
-             var out = new ZipOutputStream(fos)) {
-            out.setLevel(Deflater.NO_COMPRESSION); // Don't compress in case the system has custom zlib library, which will case hash differences
-
-            var uncloseable = new OutputStreamWriter(out, StandardCharsets.UTF_8) {
-                public void close() throws IOException {
-                    this.flush();
-                }
+            record Type(String file, Function<SideData, Map<String, Info>> data) {}
+            var types = new Type[] {
+                new Type("packages.csv", SideData::packages),
+                new Type("classes.csv", SideData::classes),
+                new Type("fields.csv", SideData::fields),
+                new Type("methods.csv", SideData::methods),
+                new Type("params.csv", SideData::params)
             };
 
-            for (var type : types) {
-                var entries = getEntries(type.file, type.data.apply(clientData), type.data.apply(serverData));
-                if (entries.size() <= 1)
-                    continue;
+            try (var fos = new FileOutputStream(output);
+                 var out = new ZipOutputStream(fos)) {
+                out.setLevel(Deflater.NO_COMPRESSION); // Don't compress in case the system has custom zlib library, which will case hash differences
 
-                out.putNextEntry(Util.getStableEntry(type.file));
+                var uncloseable = new OutputStreamWriter(out, StandardCharsets.UTF_8) {
+                    public void close() throws IOException {
+                        this.flush();
+                    }
+                };
 
-                try (var writer = CsvWriter.builder()
-                        .lineDelimiter(LineDelimiter.LF)
-                        .build(uncloseable)) {
-                    for (var row : entries)
-                        writer.writeRecord(row);
+                for (var type : types) {
+                    var entries = getEntries(type.file, type.data.apply(clientData), type.data.apply(serverData));
+                    if (entries.size() <= 1)
+                        continue;
+
+                    out.putNextEntry(Util.getStableEntry(type.file));
+
+                    try (var writer = CsvWriter.builder()
+                                               .lineDelimiter(LineDelimiter.LF)
+                                               .build(uncloseable)) {
+                        for (var row : entries)
+                            writer.writeRecord(row);
+                    }
+
+                    out.closeEntry();
                 }
-
-                out.closeEntry();
             }
-        }
-
-        cache.save();
-        return output;
+        });
     }
 
     private static List<String[]> getEntries(String file, Map<String, Info> cData, Map<String, Info> sData) {

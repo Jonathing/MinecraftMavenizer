@@ -4,25 +4,19 @@
  */
 package net.minecraftforge.mcmaven.impl.repo.mcpconfig;
 
-import net.minecraftforge.mcmaven.impl.GlobalOptions;
+import net.minecraftforge.mcmaven.impl.cache.Cache;
+import net.minecraftforge.mcmaven.impl.mappings.Mappings;
 import net.minecraftforge.mcmaven.impl.repo.Repo;
 import net.minecraftforge.mcmaven.impl.tasks.RecompileTask;
 import net.minecraftforge.mcmaven.impl.tasks.RenameTask;
-import net.minecraftforge.mcmaven.impl.cache.Cache;
-import net.minecraftforge.mcmaven.impl.mappings.Mappings;
 import net.minecraftforge.mcmaven.impl.util.Artifact;
 import net.minecraftforge.mcmaven.impl.util.POMBuilder;
 import net.minecraftforge.mcmaven.impl.util.Task;
-import net.minecraftforge.mcmaven.impl.util.Util;
 import net.minecraftforge.util.file.FileUtils;
-import net.minecraftforge.util.hash.HashStore;
 
-import javax.xml.parsers.ParserConfigurationException;
-import javax.xml.transform.TransformerException;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
@@ -30,7 +24,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /*
  * Provides the following artifacts:
@@ -101,19 +94,19 @@ public final class MCPConfigRepo extends Repo {
         var name = Artifact.from("net.minecraft", side, version);
 
         return switch (mappings.channel()) {
-            case "notch" -> List.of(pending("Classes", mcpTasks.getRawJar(), name.withClassifier("raw"), simpleVariant("obf-notch", new Mappings("notch", null))));
-            case "srg", "searge" -> List.of(pending("Classes", mcpTasks.getSrgJar(), name.withClassifier("srg"), simpleVariant("obf-searge", new Mappings("searge", null))));
+            case "notch" ->
+                List.of(pending("Classes", mcpTasks.getRawJar(), name.withClassifier("raw"), simpleVariant("obf-notch", new Mappings("notch", null))));
+            case "srg", "searge" ->
+                List.of(pending("Classes", mcpTasks.getSrgJar(), name.withClassifier("srg"), simpleVariant("obf-searge", new Mappings("searge", null))));
             default -> {
-                var pending = new ArrayList<PendingArtifact>();
-
                 var sourcesTask = new RenameTask(build, name, mcpSide, mcpSide.getSources(), mappings);
-                var recompile = new RecompileTask(build, name, mcpSide.getMCP(), mcpSide::getClasspath, sourcesTask.get(), mappings);
-                var classesTask = mergeExtra(build, side, recompile.get(), mcpSide.getTasks().getExtra(), mappings);
+                var recompile = new RecompileTask(build, name, mcpSide.getMCP(), mcpSide::getClasspath, sourcesTask, mappings);
+                var classesTask = mergeExtra(build, side, recompile, mcpSide.getTasks().getExtra(), mappings);
 
-                var sources = pending("Sources", sourcesTask.get(), name.withClassifier("sources"), sourceVariant(mappings));
+                var sources = pending("Sources", sourcesTask, name.withClassifier("sources"), sourceVariant(mappings));
                 var classes = pending("Classes", classesTask, name, () -> classVariants(mappings, mcpSide));
                 var metadata = pending("Metadata", metadata(build, mcpSide), name.withClassifier("metadata").withExtension("zip"));
-                pending.addAll(List.of(
+                var pending = new ArrayList<>(List.of(
                     sources, classes, metadata
                 ));
 
@@ -150,126 +143,89 @@ public final class MCPConfigRepo extends Repo {
 
     // TODO [MCMavenizer][client-extra] Band-aid fix for merging for clean! Remove later.
     private static Task mergeExtra(File build, String side, Task recompiled, Task extra, Mappings mappings) {
-        return Task.named("mergeExtra[" + side + "][" + mappings + ']', Set.of(extra, recompiled), () -> {
-            var output = new File(mappings.getFolder(build), "recompiled-extra.jar");
-            var recompiledF = recompiled.get();
-            var extraF = extra.get();
-            var cache = HashStore
-                .fromFile(output)
-                .add(recompiledF, extraF);
-            if (output.exists() && cache.isSame())
-                return output;
+        return Task.cachingFile("mergeExtra[" + side + "][" + mappings + ']',
+            Task.deps(extra, recompiled),
+            new File(mappings.getFolder(build), "recompiled-extra.jar"),
+            (callback, output) -> {
+                var recompiledF = recompiled.execute();
+                var extraF = extra.execute();
 
-            GlobalOptions.assertNotCacheOnly();
-
-            try {
-                FileUtils.mergeJars(output, true, extraF, recompiledF);
-            } catch (IOException e) {
-                Util.sneak(e);
-            }
-
-            cache.save();
-            return output;
-        });
+                callback.setup(cache -> cache.add(recompiledF, extraF));
+                callback.run(cache -> FileUtils.mergeJars(output, true, extraF, recompiledF));
+            });
     }
 
     private static Task metadata(File build, MCPSide side) {
         var minecraftTasks = side.getMCP().getMinecraftTasks();
-        return Task.named("metadata[forge]", Set.of(minecraftTasks.versionJson), () -> {
-            var output = new File(build, "metadata.zip");
+        return Task.cachingFile("metadata[forge]",
+            Task.deps(minecraftTasks.versionJson),
+            new File(build, "metadata.zip"),
+            (callback, output) -> {
+                // metadata
+                var metadataDir = new File(output.getParentFile(), "metadata");
+                var versionProperties = new File(metadataDir, "version.properties");
 
-            // metadata
-            var metadataDir = new File(output.getParentFile(), "metadata");
-            var versionProperties = new File(metadataDir, "version.properties");
-
-            // metadata/minecraft
-            var minecraftDir = new File(metadataDir, "minecraft");
-            var versionJson = minecraftTasks.versionJson.get();
-
-            var cache = HashStore
-                .fromFile(output)
-                .add(versionJson)
-                .add(versionProperties);
-            if (output.exists() && cache.isSame())
-                return output;
-
-            GlobalOptions.assertNotCacheOnly();
-
-            try {
-                FileUtils.ensureParent(output);
+                // metadata/minecraft
+                var minecraftDir = new File(metadataDir, "minecraft");
+                var versionJson = minecraftTasks.versionJson.execute();
                 FileUtils.ensure(metadataDir);
                 FileUtils.ensure(minecraftDir);
 
-                // version.properties
-                try (FileWriter writer = new FileWriter(versionProperties)) {
-                    // TODO [MCMavenizer][ForgeRepo] make this configurable later
-                    writer.append("version=1").append('\n').flush();
-                }
+                callback.setup(cache -> {
+                    cache.add(versionJson);
+                    cache.add(versionProperties);
+                });
 
-                // version.json
-                Files.copy(
-                    versionJson.toPath(),
-                    new File(minecraftDir, "version.json").toPath(),
-                    StandardCopyOption.REPLACE_EXISTING
-                );
-                cache.add(versionProperties);
+                callback.run(cache -> {
+                    // version.properties
+                    try (FileWriter writer = new FileWriter(versionProperties)) {
+                        // TODO [MCMavenizer][ForgeRepo] make this configurable later
+                        writer.append("version=1").append('\n').flush();
+                    }
 
-                // metadata.zip
-                FileUtils.makeZip(metadataDir, output);
-            } catch (IOException e) {
-                Util.sneak(e);
-            }
+                    // version.json
+                    Files.copy(
+                        versionJson.toPath(),
+                        new File(minecraftDir, "version.json").toPath(),
+                        StandardCopyOption.REPLACE_EXISTING
+                    );
+                    cache.add(versionProperties);
 
-            cache.save();
-            return output;
-        });
+                    // metadata.zip
+                    FileUtils.makeZip(metadataDir, output);
+                });
+            });
     }
 
     private static Task pom(File build, String side, MCPSide mcpSide, String version) {
-        return Task.named("pom[" + side + ']', () -> {
-            var output = new File(build, side + ".pom");
-            var cache = HashStore.fromFile(output);
-            if (output.exists() && cache.isSame())
-                return output;
+        return Task.cachingFile("pom[" + side + ']',
+            new File(build, side + ".pom"),
+            (callback, output) -> {
+                callback.run(cache -> {
+                    var builder = new POMBuilder("net.minecraft", side, version).preferGradleModule().dependencies(dependencies -> {
+                        mcpSide.forAllLibraries(dependencies::add, Artifact::hasNoOs);
+                    });
 
-            GlobalOptions.assertNotCacheOnly();
-
-            var builder = new POMBuilder("net.minecraft", side, version).preferGradleModule().dependencies(dependencies -> {
-                mcpSide.forAllLibraries(dependencies::add, Artifact::hasNoOs);
+                    FileUtils.ensureParent(output);
+                    try (var os = new FileOutputStream(output)) {
+                        os.write(builder.build().getBytes(StandardCharsets.UTF_8));
+                    }
+                });
             });
-
-            FileUtils.ensureParent(output);
-            try (var os = new FileOutputStream(output)) {
-                os.write(builder.build().getBytes(StandardCharsets.UTF_8));
-            } catch (IOException | ParserConfigurationException | TransformerException e) {
-                Util.sneak(e);
-            }
-
-            cache.save();
-            return output;
-        });
     }
 
     private static Task pomExtra(File build, String side, String version) {
-        return Task.named("pom[" + side + ']', () -> {
-            var output = new File(build, side + ".pom");
-            var cache = HashStore.fromFile(output);
-            if (output.exists() && cache.isSame())
-                return output;
+        return Task.cachingFile("pom[" + side + "-extra]",
+            new File(build, side + ".pom"),
+            (callback, output) -> {
+                callback.run(cache -> {
+                    var builder = new POMBuilder("net.minecraft", side, version);
 
-            GlobalOptions.assertNotCacheOnly();
-
-            var builder = new POMBuilder("net.minecraft", side, version);
-
-            FileUtils.ensureParent(output);
-            try (var os = new FileOutputStream(output)) {
-                os.write(builder.build().getBytes(StandardCharsets.UTF_8));
-            } catch (IOException | ParserConfigurationException | TransformerException e) {
-                Util.sneak(e);
-            }
-
-            cache.save();
-            return output;
-        });
+                    FileUtils.ensureParent(output);
+                    try (var os = new FileOutputStream(output)) {
+                        os.write(builder.build().getBytes(StandardCharsets.UTF_8));
+                    }
+                });
+            });
     }
 }

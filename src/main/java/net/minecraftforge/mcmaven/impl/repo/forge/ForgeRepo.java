@@ -15,34 +15,28 @@ import net.minecraftforge.mcmaven.impl.tasks.RenameTask;
 import net.minecraftforge.mcmaven.impl.util.Artifact;
 import net.minecraftforge.mcmaven.impl.util.ComparableVersion;
 import net.minecraftforge.mcmaven.impl.util.Constants;
-import net.minecraftforge.mcmaven.impl.GlobalOptions;
 import net.minecraftforge.mcmaven.impl.util.POMBuilder;
 import net.minecraftforge.mcmaven.impl.util.Task;
 import net.minecraftforge.mcmaven.impl.util.Util;
 import net.minecraftforge.util.data.json.JsonData;
 import net.minecraftforge.util.file.FileUtils;
-import net.minecraftforge.util.hash.HashStore;
 import net.minecraftforge.util.logging.Log;
 
-import javax.xml.parsers.ParserConfigurationException;
-import javax.xml.transform.TransformerException;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.FileWriter;
-import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Stream;
 
 // TODO: [MCMavenizer][ForgeRepo] For now, the ForgeRepo needs to be fully complete with everything it has to do.
-// later, we can worry about refactoring it so that other repositories such as MCP (clean) and FMLOnly can function.
-// And yes, I DO want this tool to support as far back as possible. But for now, we worry about UserDev3 and up.
-// - Jonathing
+//  later, we can worry about refactoring it so that other repositories such as MCP (clean) and FMLOnly can function.
+//  And yes, I DO want this tool to support as far back as possible. But for now, we worry about UserDev3 and up.
+//  - Jonathing
 
 /** Represents the Forge repository. */
 public final class ForgeRepo extends Repo {
@@ -135,8 +129,8 @@ public final class ForgeRepo extends Repo {
         var patcher = new Patcher(build, this, userdev);
         var joined = patcher.getMCP().getSide(MCPSide.JOINED);
         var sourcesTask = new RenameTask(build, userdev, joined, patcher.get(), mappings);
-        var recompile = new RecompileTask(build, name, patcher.getMCP(), patcher::getClasspath, sourcesTask.get(), mappings);
-        var classesTask = new InjectTask(build, this.cache, name, patcher, recompile.get(), mappings);
+        var recompile = new RecompileTask(build, name, patcher.getMCP(), patcher::getClasspath, sourcesTask, mappings);
+        var classesTask = new InjectTask(build, this.cache, name, patcher, recompile, mappings);
 
         var extraCoords = Artifact.from(Constants.MC_GROUP, Constants.MC_CLIENT + "-extra", patcher.getMCP().getName().getVersion());
         var mappingCoords = mappings.getArtifact(joined);
@@ -144,8 +138,8 @@ public final class ForgeRepo extends Repo {
         var mapzip = pending("Mappings Zip", mappings.getCsvZip(joined), mappingCoords);
         var mappom = pending("Mappings POM", simplePom(build, mappingCoords), mappingCoords.withExtension("pom"));
 
-        var sources = pending("Sources", sourcesTask.get(), name.withClassifier("sources"), sourceVariant(mappings));
-        var classes = pending("Classes", classesTask.get(), name, () -> classVariants(mappings, patcher, extraCoords, mappingCoords));
+        var sources = pending("Sources", sourcesTask, name.withClassifier("sources"), sourceVariant(mappings));
+        var classes = pending("Classes", classesTask, name, () -> classVariants(mappings, patcher, extraCoords, mappingCoords));
         var metadata = pending("Metadata", metadata(build, patcher), name.withClassifier("metadata").withExtension("zip"));
 
         PendingArtifact pom = null;
@@ -160,103 +154,85 @@ public final class ForgeRepo extends Repo {
     }
 
     private static Task metadata(File build, Patcher patcher) {
-        return Task.named("metadata[forge]", Set.of(patcher.getMCP().getMinecraftTasks().versionJson), () -> {
-            var output = new File(build, "metadata.zip");
+        return Task.cachingFile("metadata[forge]",
+            Task.deps(patcher.getMCP().getMinecraftTasks().versionJson),
+            new File(build, "metadata.zip"),
+            (callback, output) -> {
+                // metadata
+                var metadataDir = new File(output.getParentFile(), "metadata");
+                var metadataVersion = "1";
+                var versionProperties = new File(metadataDir, "version.properties");
 
-            // metadata
-            var metadataDir = new File(output.getParentFile(), "metadata");
-            var versionProperties = new File(metadataDir, "version.properties");
+                // metadata/launcher
+                var launcherDir = new File(metadataDir, "launcher");
+                var runsJsonStr = JsonData.toJson(patcher.config.runs);
 
-            // metadata/launcher
-            var launcherDir = new File(metadataDir, "launcher");
-            var runsJsonStr = JsonData.toJson(patcher.config.runs);
+                // metadata/minecraft
+                var minecraftDir = new File(metadataDir, "minecraft");
+                var versionJson = patcher.getMCP().getMinecraftTasks().versionJson.execute();
 
-            // metadata/minecraft
-            var minecraftDir = new File(metadataDir, "minecraft");
-            var versionJson = patcher.getMCP().getMinecraftTasks().versionJson.get();
+                callback.setup(cache -> cache
+                    .add("data", patcher.getDataHash())
+                    .add("versionJson", versionJson)
+                    .addKnown("version", metadataVersion));
 
-            var cache = HashStore
-                .fromFile(output)
-                .add("data", patcher.getDataHash())
-                .add(versionJson)
-                .addKnown("version", "1");
-            if (output.exists() && cache.isSame())
-                return output;
+                callback.run(cache -> {
+                    FileUtils.ensure(metadataDir);
+                    FileUtils.ensure(launcherDir);
+                    FileUtils.ensure(minecraftDir);
 
-            GlobalOptions.assertNotCacheOnly();
+                    // version.properties
+                    try (FileWriter writer = new FileWriter(versionProperties)) {
+                        // TODO [MCMavenizer][ForgeRepo] make this configurable later
+                        writer.append("version=").append(metadataVersion).append('\n').flush();
+                    }
 
-            try {
-                FileUtils.ensureParent(output);
-                FileUtils.ensure(metadataDir);
-                FileUtils.ensure(launcherDir);
-                FileUtils.ensure(minecraftDir);
+                    // runs.json
+                    Files.writeString(
+                        new File(launcherDir, "runs.json").toPath(),
+                        runsJsonStr,
+                        StandardCharsets.UTF_8
+                    );
 
-                // version.properties
-                try (FileWriter writer = new FileWriter(versionProperties)) {
-                    // TODO [MCMavenizer][ForgeRepo] make this configurable later
-                    writer.append("version=1").append('\n').flush();
-                }
+                    // version.json
+                    Files.copy(
+                        versionJson.toPath(),
+                        new File(minecraftDir, "version.json").toPath(),
+                        StandardCopyOption.REPLACE_EXISTING
+                    );
 
-                // runs.json
-                Files.writeString(
-                    new File(launcherDir, "runs.json").toPath(),
-                    runsJsonStr,
-                    StandardCharsets.UTF_8
-                );
-
-                // version.json
-                Files.copy(
-                    versionJson.toPath(),
-                    new File(minecraftDir, "version.json").toPath(),
-                    StandardCopyOption.REPLACE_EXISTING
-                );
-                cache.add(versionProperties);
-
-                // metadata.zip
-                FileUtils.makeZip(metadataDir, output);
-            } catch (IOException e) {
-                Util.sneak(e);
-            }
-
-            cache.save();
-            return output;
-        });
+                    // metadata.zip
+                    FileUtils.makeZip(metadataDir, output);
+                });
+            });
     }
 
     private static Task pom(File build, Patcher patcher, String version, Artifact clientExtra, Artifact mappings) {
-        return Task.named("pom[forge]", () -> {
-            var output = new File(build, "forge.pom");
-            var cache = HashStore.fromFile(output)
-                .addKnown("data", patcher.getDataHash())
-                .addKnown("extra", Util.replace(clientExtra, Object::toString))
-                .addKnown("mappings", Util.replace(mappings, Object::toString))
-                ;
+        return Task.cachingFile("pom[forge]",
+            new File(build, "forge.pom"),
+            (callback, output) -> {
+                callback.setup(cache -> cache
+                    .addKnown("data", patcher.getDataHash())
+                    .addKnown("extra", Util.replace(clientExtra, Object::toString))
+                    .addKnown("mappings", Util.replace(mappings, Object::toString)));
 
-            if (output.exists() && cache.isSame())
-                return output;
+                callback.run(cache -> {
+                    var builder = new POMBuilder("net.minecraftforge", "forge", version).preferGradleModule().dependencies(dependencies -> {
+                        if (clientExtra != null)
+                            dependencies.add(clientExtra);
 
-            GlobalOptions.assertNotCacheOnly();
+                        if (mappings != null)
+                            dependencies.add(mappings);
 
-            var builder = new POMBuilder("net.minecraftforge", "forge", version).preferGradleModule().dependencies(dependencies -> {
-                if (clientExtra != null)
-                    dependencies.add(clientExtra);
+                        patcher.forAllLibraries(dependencies::add, Artifact::hasNoOs);
+                    });
 
-                if (mappings != null)
-                    dependencies.add(mappings);
-
-                patcher.forAllLibraries(dependencies::add, Artifact::hasNoOs);
+                    FileUtils.ensureParent(output);
+                    try (var os = new FileOutputStream(output)) {
+                        os.write(builder.build().getBytes(StandardCharsets.UTF_8));
+                    }
+                });
             });
-
-            FileUtils.ensureParent(output);
-            try (var os = new FileOutputStream(output)) {
-                os.write(builder.build().getBytes(StandardCharsets.UTF_8));
-            } catch (IOException | ParserConfigurationException | TransformerException e) {
-                Util.sneak(e);
-            }
-
-            cache.save();
-            return output;
-        });
     }
 
     protected GradleModule.Variant[] classVariants(Mappings mappings, Patcher patcher, Artifact... extraDeps) {

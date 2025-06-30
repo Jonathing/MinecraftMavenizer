@@ -73,11 +73,12 @@ public abstract class Repo {
         };
     }
 
+    // TODO [Mavenizer][Caching] Cache this?
     protected static Task variantTask(Task parent, Supplier<GradleModule.Variant[]> supplier) {
-        return Task.named(parent.name() + "[variants]", List.of(parent), () -> {
+        return Task.simple(parent.getName() + "[variants]", Task.deps(parent), () -> {
             var variants = supplier.get();
 
-            var variantFile = new File(parent.get().getAbsolutePath() + ".variants");
+            var variantFile = new File(parent.execute().getAbsolutePath() + ".variants");
             try {
                 FileUtils.ensureParent(variantFile);
                 JsonData.toJson(variants, variantFile);
@@ -121,7 +122,7 @@ public abstract class Repo {
         }
 
         var java = Util.replace(
-            JsonData.minecraftVersion(side.getMCP().getMinecraftTasks().versionJson.get()),
+            JsonData.minecraftVersion(side.getMCP().getMinecraftTasks().versionJson.execute()),
             v -> v.javaVersion != null ? v.javaVersion.majorVersion : null
         );
 
@@ -157,25 +158,18 @@ public abstract class Repo {
         return variants.toArray(new GradleModule.Variant[0]);
     }
 
+    // TODO [Mavenizer][Caching] Cache this?
     protected static Task simplePom(File build, Artifact artifact) {
-        return Task.named("pom[" + artifact.getName() + ']', () -> {
+        return Task.simple("pom[" + artifact.getName() + ']', () -> {
             var output = new File(build, artifact.getName() + '-' + artifact.getVersion() + ".pom");
-            var cache = HashStore.fromFile(output);
-            if (output.exists() && cache.isSame())
-                return output;
 
-            GlobalOptions.assertNotCacheOnly();
-
-            var builder = new POMBuilder(artifact.getGroup(), artifact.getName(), artifact.getVersion());
+            var builder = new POMBuilder(artifact);
 
             FileUtils.ensureParent(output);
             try (var os = new FileOutputStream(output)) {
                 os.write(builder.build().getBytes(StandardCharsets.UTF_8));
-            } catch (IOException | ParserConfigurationException | TransformerException e) {
-                Util.sneak(e);
             }
 
-            cache.save();
             return output;
         });
     }
@@ -195,23 +189,21 @@ public abstract class Repo {
 
         @Override
         public File get() {
-            if (this.task.resolved())
-                return this.task.get();
-
-            try {
-                Log.info(this.message);
-                Log.push();
+            if (this.task.isResolved())
                 return this.task.execute();
-            } finally {
+
+            Log.info(this.message);
+            var indent = Log.push();
+            try {
+                var result = this.task.execute();
+
                 if (this.variants != null)
                     this.variants.execute();
 
-                Log.pop();
+                return result;
+            } finally {
+                Log.pop(indent);
             }
-        }
-
-        public Task getAsTask() {
-            return task;
         }
 
         public Artifact getArtifact() {
