@@ -15,6 +15,7 @@ import org.jetbrains.annotations.Contract;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.List;
@@ -28,8 +29,8 @@ import java.util.stream.StreamSupport;
 
 /**
  * A task represents a work action that generates a file.
- * <p>The {@link Cacheable} implementation has built-in caching using {@link HashStore}, and it is recommended to create
- * tasks this way using {@link #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)}.
+ * <p>The {@link Cacheable} implementation has built-in caching using {@link HashStore}, and it is recommended to
+ * create tasks this way using {@link #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)}.
  */
 public interface Task {
     /**
@@ -118,6 +119,8 @@ public interface Task {
             // run all task dependencies (order enforced by SequencedCollection)
             for (var t : this.dependencies) {
                 var task = t.get();
+                if (task == null) continue; // Some automated task generators may have a null parent, which is fine.
+
                 try {
                     task.execute();
                 } catch (Exception e) {
@@ -130,7 +133,7 @@ public interface Task {
             try {
                 return this.result = this.doWork();
             } catch (Exception e) {
-                throw new RuntimeException("Failed to execute task `%s`".formatted(this.getName()));
+                throw new RuntimeException("Failed to execute task `%s`".formatted(this.getName()), e);
             } finally {
                 Log.pop(indent);
             }
@@ -180,123 +183,149 @@ public interface Task {
     /**
      * Creates a simple cacheable task that outputs a single regular file.
      *
-     * @param name     The unique name for the task
-     * @param output   The output file for the task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
      * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      * @see #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
      */
-    static Task cachingFile(String name, File output, Cacheable.CallbackConsumer callbackConsumer) {
+    static Task cachingFile(
+        String name,
+        File output,
+        Cacheable.CallbackConsumer callbackConsumer) {
         return cachingFile(name, () -> output, callbackConsumer);
     }
 
     /**
      * Creates a simple cacheable task that outputs a single regular file.
      *
-     * @param name     The unique name for the task
-     * @param output   The output file for the task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
      * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      * @see #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
      */
-    static Task cachingFile(String name, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
+    static Task cachingFile(
+        String name,
+        Callable<File> output,
+        Cacheable.CallbackConsumer callbackConsumer) {
         return cachingFile(name, List.of(), output, callbackConsumer);
     }
 
     /**
      * Creates a simple cacheable task that outputs a single regular file.
      *
-     * @param name         The unique name for the task
-     * @param output       The output file for the task
-     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
-     * @param callbackConsumer     The callback consumer to use for this task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
+     * @param dependencies     The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      */
-    static Task cachingFile(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, File output, Cacheable.CallbackConsumer callbackConsumer) {
+    static Task cachingFile(
+        String name,
+        SequencedCollection<? extends Supplier<? extends Task>> dependencies,
+        File output,
+        Cacheable.CallbackConsumer callbackConsumer) {
         return cachingFile(name, dependencies, () -> output, callbackConsumer);
     }
 
     /**
      * Creates a simple cacheable task that outputs a single regular file.
      *
-     * @param name         The unique name for the task
-     * @param output       The output file for the task
-     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
-     * @param callbackConsumer     The callback consumer to use for this task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
+     * @param dependencies     The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      */
-    static Task cachingFile(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
-        return new Cacheable(name, dependencies, output, callbackConsumer, o -> Files.createDirectories(o.getParentFile().toPath()), o -> HashStore.fromFile(o).add("output", o), (c, o) -> c.add("output", o));
+    static Task cachingFile(
+        String name,
+        SequencedCollection<? extends Supplier<? extends Task>> dependencies,
+        Callable<File> output,
+        Cacheable.CallbackConsumer callbackConsumer) {
+        return new Cacheable(name, dependencies, output, callbackConsumer, Cacheable.TaskHashStore::fromFile, Cacheable.TaskHashStore::finishFile);
     }
 
     /**
      * Creates a simple cacheable task that outputs a directory.
      *
-     * @param name     The unique name for the task
-     * @param output   The output file for the task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
      * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      * @see #cachingDir(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
      */
-    static Task cachingDir(String name, File output, Cacheable.CallbackConsumer callbackConsumer) {
+    static Task cachingDir(
+        String name,
+        File output,
+        Cacheable.CallbackConsumer callbackConsumer) {
         return cachingDir(name, () -> output, callbackConsumer);
     }
 
     /**
      * Creates a simple cacheable task that outputs a directory.
      *
-     * @param name     The unique name for the task
-     * @param output   The output file for the task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
      * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      * @see #cachingDir(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)
      */
-    static Task cachingDir(String name, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
+    static Task cachingDir(
+        String name,
+        Callable<File> output,
+        Cacheable.CallbackConsumer callbackConsumer) {
         return cachingDir(name, List.of(), output, callbackConsumer);
     }
 
     /**
      * Creates a simple cacheable task that outputs a directory.
      *
-     * @param name         The unique name for the task
-     * @param output       The output file for the task
-     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
-     * @param callbackConsumer     The callback consumer to use for this task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
+     * @param dependencies     The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      */
-    static Task cachingDir(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, File output, Cacheable.CallbackConsumer callbackConsumer) {
+    static Task cachingDir(
+        String name,
+        SequencedCollection<? extends Supplier<? extends Task>> dependencies,
+        File output,
+        Cacheable.CallbackConsumer callbackConsumer) {
         return cachingDir(name, dependencies, () -> output, callbackConsumer);
     }
 
     /**
      * Creates a simple cacheable task that outputs a directory.
      *
-     * @param name         The unique name for the task
-     * @param output       The output file for the task
-     * @param dependencies The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
-     * @param callbackConsumer     The callback consumer to use for this task
+     * @param name             The unique name for the task
+     * @param output           The output file for the task
+     * @param dependencies     The dependencies for this task (allowed types are ({@link Supplier} of) {@link Task})
+     * @param callbackConsumer The callback consumer to use for this task
      * @return A new task
      */
-    static Task cachingDir(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, Cacheable.CallbackConsumer callbackConsumer) {
-        return new Cacheable(name, dependencies, output, callbackConsumer, o -> Files.createDirectories(o.toPath()), HashStore::fromDir, (c, o) -> { });
+    static Task cachingDir(
+        String name,
+        SequencedCollection<? extends Supplier<? extends Task>> dependencies,
+        Callable<File> output,
+        Cacheable.CallbackConsumer callbackConsumer) {
+        return new Cacheable(name, dependencies, output, callbackConsumer, Cacheable.TaskHashStore::fromDir, Cacheable.TaskHashStore::finishDir);
     }
 
     final class Cacheable extends Abstract {
         private final Callable<File> output;
         private final CallbackConsumer callbackConsumer;
 
-        private final CallableConsumer<? super File> outputEnsurer;
-        private final CallableFunction<? super File, ? extends HashStore> cacheProvider;
-        private final CallableBiConsumer<? super HashStore, ? super File> cacheFinisher;
+        private final CallableFunction<? super File, TaskHashStore> cacheProvider;
+        private final CallableBiConsumer<TaskHashStore, ? super File> cacheFinisher;
 
         private boolean upToDate;
 
-        private Cacheable(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, CallbackConsumer callbackConsumer, CallableConsumer<? super File> outputEnsurer, CallableFunction<? super File, ? extends HashStore> cacheProvider, CallableBiConsumer<? super HashStore, ? super File> cacheFinisher) {
+        private Cacheable(String name, SequencedCollection<? extends Supplier<? extends Task>> dependencies, Callable<File> output, CallbackConsumer callbackConsumer, CallableFunction<? super File, TaskHashStore> cacheProvider, CallableBiConsumer<TaskHashStore, ? super File> cacheFinisher) {
             super(name, dependencies);
             this.output = output;
             this.callbackConsumer = callbackConsumer;
 
-            this.outputEnsurer = outputEnsurer;
             this.cacheProvider = cacheProvider;
             this.cacheFinisher = cacheFinisher;
         }
@@ -311,13 +340,12 @@ public interface Task {
 
         protected File doWork() throws Exception {
             var output = this.output.call().getAbsoluteFile();
-            this.outputEnsurer.accept(output);
             var cache = this.cacheProvider.accept(output);
 
             var callback = new CallbackImpl().check(c -> output.exists() && c.isSame());
             this.callbackConsumer.accept(callback, output);
 
-            callback.setup.accept(cache);
+            callback.setup.accept(cache.lock());
             boolean cacheMiss = !callback.check.test(cache);
             if (cacheMiss) {
                 GlobalOptions.assertNotCacheOnly();
@@ -327,7 +355,7 @@ public interface Task {
                 if (cache.isSaved()) {
                     throw new IllegalStateException("Task `%s` attempted to save cache manually, this is handled internally".formatted(this.getName()));
                 } else {
-                    this.cacheFinisher.accept(cache, output);
+                    this.cacheFinisher.accept(cache.unlock(), output);
                     cache.save();
                 }
             } else {
@@ -363,20 +391,24 @@ public interface Task {
         }
 
         private static final class CallbackImpl implements Callback {
-            private CallableConsumer<? super HashStore> setup = c -> { };
-            private Predicate<? super HashStore> check = c -> true;
-            private CallableConsumer<? super HashStore> run = c -> { };
-            private CallableBoolConsumer cleanup = b -> { };
+            private CallableConsumer<? super HashStore> setup = CallableConsumer.empty();
+            private Predicate<? super HashStore> check = truePredicate();
+            private CallableConsumer<? super HashStore> run = CallableConsumer.empty();
+            private CallableBoolConsumer cleanup = CallableBoolConsumer.empty();
+
+            private static <T> Predicate<T> truePredicate() {
+                return t -> true;
+            }
 
             @Override
             public CallbackImpl setup(CallableConsumer<? super HashStore> setup) {
-                this.setup = setup != null ? setup : c -> { };
+                this.setup = setup != null ? setup : CallableConsumer.empty();
                 return this;
             }
 
             @Override
             public CallbackImpl check(Predicate<? super HashStore> check) {
-                this.check = check != null ? check : c -> true;
+                this.check = check != null ? check : truePredicate();
                 return this;
             }
 
@@ -389,13 +421,13 @@ public interface Task {
 
             @Override
             public CallbackImpl run(CallableConsumer<? super HashStore> run) {
-                this.run = run != null ? run : c -> { };
+                this.run = run != null ? run : CallableConsumer.empty();
                 return this;
             }
 
             @Override
             public Callback cleanup(CallableBoolConsumer cleanup) {
-                this.cleanup = cleanup != null ? cleanup : b -> { };
+                this.cleanup = cleanup != null ? cleanup : CallableBoolConsumer.empty();
                 return this;
             }
         }
@@ -404,5 +436,73 @@ public interface Task {
             void accept(Callback callback, File output) throws Exception;
         }
 
+        private static final class TaskHashStore extends HashStore {
+            public static TaskHashStore fromFile(File path) {
+                var file = path.getAbsoluteFile();
+                var parent = file.getParentFile();
+                ensure(parent);
+
+                return (TaskHashStore) new TaskHashStore(file)
+                    .load(new File(parent, file.getName() + ".cache"))
+                    .add("output", file);
+            }
+
+            public static TaskHashStore fromDir(File path) {
+                var directory = path.getAbsoluteFile();
+                var parent = directory.getParentFile();
+                ensure(directory);
+
+                return (TaskHashStore) new TaskHashStore(directory)
+                    .load(new File(parent, directory.getName() + ".dir.cache"));
+            }
+
+            private static void finishFile(TaskHashStore cache, File output) {
+                cache.add("output", output);
+            }
+
+            private static void finishDir(TaskHashStore cache, File output) {
+                // NO-OP
+            }
+
+            private static void ensure(File path) {
+                try {
+                    Files.createDirectories(path.toPath());
+                } catch (IOException e) {
+                    Util.sneak(e);
+                }
+            }
+
+            private boolean locked;
+
+            private TaskHashStore(File root) {
+                super(root);
+            }
+
+            private TaskHashStore lock() {
+                this.locked = true;
+                return this;
+            }
+
+            private TaskHashStore unlock() {
+                this.locked = false;
+                return this;
+            }
+
+            @Override
+            public void save(File file) {
+                if (this.locked)
+                    throw new UnsupportedOperationException("Cannot manually call HashStore#save when using Task.Cacheable");
+
+                super.save(file);
+            }
+
+            @Override
+            public void save() {
+                if (this.locked)
+                    throw new UnsupportedOperationException("Cannot manually call HashStore#save when using Task.Cacheable");
+
+                super.save();
+            }
+        }
     }
 }

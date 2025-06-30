@@ -6,5 +6,9 @@ package net.minecraftforge.mcmaven.impl.util.function;
 
 @FunctionalInterface
 public interface CallableBoolConsumer {
+    static CallableBoolConsumer empty() {
+        return bool -> { };
+    }
+
     void accept(boolean bool) throws Exception;
 }
