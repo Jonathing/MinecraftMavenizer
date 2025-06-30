@@ -290,8 +290,6 @@ public class MCPTaskFactory {
                             zip.getInputStream(entry).transferTo(os);
                         }
                         target.setLastModified(entry.getLastModifiedTime().toMillis());
-
-                        cache.save();
                     } catch (IOException e) {
                         throw except("Failed to extract `" + key + "`: `" + value + "`");
                     }
@@ -352,7 +350,7 @@ public class MCPTaskFactory {
                         if (count == 0)
                             throw except("Missing data: `" + key + "`: `" + value + "`");
 
-                        cache.save();
+                        cache.add(FileUtils.listFiles(base));
                     } catch (IOException e) {
                         throw except("Failed to extract `" + key + "`: `" + value + "`");
                     }
@@ -398,11 +396,11 @@ public class MCPTaskFactory {
 
     private Task strip(String name, Map<String, String> step) {
         var whitelist = "whitelist".equalsIgnoreCase(step.getOrDefault("mode", "whitelist"));
-        var input = findStep(step.get("input"));
+        Supplier<Task> input = () -> findStep(step.get("input"));
         return Task.cachingFile(name,
-            Task.deps(input, this.mappings),
+            Task.deps(input, () -> this.mappings),
             new File(this.build, name + ".jar"),
-            (c, o) -> strip(c, o, input, whitelist)
+            (c, o) -> strip(c, o, input.get(), whitelist)
         );
     }
 

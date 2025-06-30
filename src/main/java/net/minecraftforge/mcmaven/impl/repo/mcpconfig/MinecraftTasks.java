@@ -71,7 +71,7 @@ public class MinecraftTasks {
     public Task versionFile(String key, String ext) {
         return this.versionFiles.computeIfAbsent(key, k ->
             Task.cachingFile("download[" + this.version + "][" + key + ']',
-                Task.deps(this.versionJson),
+                Task.deps(() -> this.versionJson),
                 new File(this.cache, this.version + '/' + key  + '.' + ext),
                 (callback, target) -> downloadVersionFile(callback, target, key, ext)
             )

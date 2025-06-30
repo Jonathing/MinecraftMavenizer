@@ -331,6 +331,7 @@ public class Patcher implements Supplier<Task> {
         return extractJoinedFiles("side_annotation_stripper.cfg", this.config.getSASs());
     }
 
+    // TODO [Mavenizer][Caching] Make this into a proper task?
     private File extractJoinedFiles(String filename, List<String> files) {
         if (files.isEmpty())
             return null;
