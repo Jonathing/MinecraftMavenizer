@@ -12,11 +12,14 @@ import net.minecraftforge.mcmaven.impl.util.function.CallableFunction;
 import net.minecraftforge.util.hash.HashStore;
 import net.minecraftforge.util.logging.Log;
 import org.jetbrains.annotations.Contract;
+import org.jetbrains.annotations.NotNullByDefault;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.UnknownNullability;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -32,6 +35,7 @@ import java.util.stream.StreamSupport;
  * <p>The {@link Cacheable} implementation has built-in caching using {@link HashStore}, and it is recommended to
  * create tasks this way using {@link #cachingFile(String, SequencedCollection, Callable, Cacheable.CallbackConsumer)}.
  */
+@NotNullByDefault
 public interface Task {
     /**
      * Executes this task and returns the output file.
@@ -113,30 +117,36 @@ public interface Task {
         @Override
         public final File execute() {
             // immediately stop if result is already calculated
-            if (this.result != null)
-                return this.result;
+            if (this.result == null) {
+                // run all task dependencies (order enforced by SequencedCollection)
+                for (var t : this.dependencies) {
+                    var task = t.get();
+                    if (task == null) continue; // Some automated task generators may have a null parent, which is fine.
 
-            // run all task dependencies (order enforced by SequencedCollection)
-            for (var t : this.dependencies) {
-                var task = t.get();
-                if (task == null) continue; // Some automated task generators may have a null parent, which is fine.
+                    try {
+                        task.execute();
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to execute task `%s` which is required by task `%s`".formatted(task.getName(), this.getName()), e);
+                    }
+                }
 
+                Log.info(this.getName());
+                var indent = Log.push();
+                var start = System.nanoTime();
                 try {
-                    task.execute();
+                    this.result = this.doWork();
+
+                    var time = Duration.ofNanos(System.nanoTime() - start);
+                    Log.debug(String.format("-> took %d:%02d.%03d", time.toMinutesPart(), time.toSecondsPart(), time.toMillisPart()));
+                    Log.debug(String.format("-> %s", this.result.getAbsolutePath()));
                 } catch (Exception e) {
-                    throw new RuntimeException("Failed to execute task `%s` which is required by task `%s`".formatted(task.getName(), this.getName()), e);
+                    throw new RuntimeException("Failed to execute task `%s`".formatted(this.getName()), e);
+                } finally {
+                    Log.pop(indent);
                 }
             }
 
-            Log.info(this.getName());
-            var indent = Log.push();
-            try {
-                return this.result = this.doWork();
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to execute task `%s`".formatted(this.getName()), e);
-            } finally {
-                Log.pop(indent);
-            }
+            return this.result;
         }
 
         protected abstract File doWork() throws Exception;
@@ -349,7 +359,6 @@ public interface Task {
             boolean cacheMiss = !callback.check.test(cache);
             if (cacheMiss) {
                 GlobalOptions.assertNotCacheOnly();
-                Log.debug("Cache miss, doing work");
 
                 callback.run.accept(cache);
                 if (cache.isSaved()) {
@@ -364,7 +373,6 @@ public interface Task {
             }
 
             callback.cleanup.accept(cacheMiss);
-            Log.debug("-> " + output.getAbsolutePath());
             return output;
         }
 
@@ -401,32 +409,32 @@ public interface Task {
             }
 
             @Override
-            public CallbackImpl setup(CallableConsumer<? super HashStore> setup) {
+            public CallbackImpl setup(@UnknownNullability CallableConsumer<? super HashStore> setup) {
                 this.setup = setup != null ? setup : CallableConsumer.empty();
                 return this;
             }
 
             @Override
-            public CallbackImpl check(Predicate<? super HashStore> check) {
+            public CallbackImpl check(@UnknownNullability Predicate<? super HashStore> check) {
                 this.check = check != null ? check : truePredicate();
                 return this;
             }
 
             @Override
-            public CallbackImpl checkWith(UnaryOperator<Predicate<? super HashStore>> check) {
+            public CallbackImpl checkWith(@UnknownNullability UnaryOperator<Predicate<? super HashStore>> check) {
                 if (check != null)
                     this.check = check.apply(this.check);
                 return this;
             }
 
             @Override
-            public CallbackImpl run(CallableConsumer<? super HashStore> run) {
+            public CallbackImpl run(@UnknownNullability CallableConsumer<? super HashStore> run) {
                 this.run = run != null ? run : CallableConsumer.empty();
                 return this;
             }
 
             @Override
-            public Callback cleanup(CallableBoolConsumer cleanup) {
+            public Callback cleanup(@UnknownNullability CallableBoolConsumer cleanup) {
                 this.cleanup = cleanup != null ? cleanup : CallableBoolConsumer.empty();
                 return this;
             }
