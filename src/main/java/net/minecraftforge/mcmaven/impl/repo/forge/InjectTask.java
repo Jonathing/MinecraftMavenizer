@@ -74,8 +74,6 @@ public final class InjectTask implements Task {
         });
 
         callback.run(cache -> {
-            cache.clear().add("recompiled", recompiledJar);
-
             var jars = new ArrayList<>(universals);
             jars.add(recompiledJar);
 
